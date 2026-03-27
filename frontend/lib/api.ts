@@ -1,4 +1,8 @@
-const BASE = process.env.NEXT_PUBLIC_GATEWAY_URL || "http://localhost:8000";
+const BASE =
+  process.env.NEXT_PUBLIC_GATEWAY_URL ||
+  (typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : "http://localhost:8000");
 
 export interface Document {
   id: string;
@@ -111,9 +115,7 @@ export async function getQueueStats(): Promise<QueueStats> {
 }
 
 export async function getModels(): Promise<{ providers: ModelProvider[] }> {
-  return req<{ providers: ModelProvider[] }>("http://query-service:8004/api/models").catch(() =>
-    fetch(`${BASE.replace("8000", "8004")}/api/models`)
-      .then((r) => r.json())
-      .catch(() => ({ providers: [] }))
-  );
+  return fetch(`${BASE.replace("8000", "8004")}/api/models`)
+    .then((r) => r.json())
+    .catch(() => ({ providers: [] }));
 }
