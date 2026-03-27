@@ -68,6 +68,20 @@ A fully distributed Retrieval-Augmented Generation system built as a **5-compone
 | **No Fat Clients** | Frontend is client-only; all logic is server-side |
 | **Decoupled Data** | Gateway/Ingestion/Embedding/Query each own their own Postgres tables; Vector Store alone talks to Qdrant |
 
+### Lab Rubric Compliance Checklist
+
+Use this checklist during demo/grading:
+
+- **5+ server-side components:** `gateway`, `ingestion-worker`, `embedding-worker`, `vector-store`, `query-service` (frontend excluded by design).
+- **Standalone isolated runtimes:** each component runs in its own Docker service/container with separate runtime and healthcheck.
+- **Network communication only:** components communicate through HTTP APIs and Redis queues (`ingestion:queue`, `embedding:queue`), not in-process calls.
+- **Functional decomposition (non-P2P):** each service has a distinct role (entry/routing, extraction, embedding, vector DB ownership, query orchestration).
+- **Inter-component dependency:** one end-to-end request (upload + query) requires multiple services to complete successfully.
+- **No fat client:** browser only handles UI; ingestion, indexing, retrieval, and generation are server-side.
+- **Decoupled data ownership:** `vector-store` exclusively owns Qdrant access; metadata is partitioned by concern in Postgres tables; Redis handles queue decoupling.
+
+This project is **not** a Simplified P2P ledger project, so functional diversity is intentionally enforced.
+
 ---
 
 ## Prerequisites
@@ -224,21 +238,131 @@ Open your browser: **http://localhost:3000**
 
 ## Running on Multiple Machines (LAN)
 
-### Host machine (runs Docker)
+Use this exact checklist for reliable Windows-to-Windows LAN connectivity.
 
-1. Complete setup above.
-2. LAN IP: `ipconfig` → IPv4 of the active adapter (e.g. `192.168.1.100`).
-3. Windows Firewall (run PowerShell **as Administrator**):
+### Topology
+
+- **Machine A (Docker Host):** runs all containers (`frontend`, `gateway`, workers, DBs).
+- **Machine B (GPU/Ollama Host, optional):** runs Ollama with models.
+- **Machines C..N (clients):** browser only.
+
+### Step 1 — Put all machines on the same LAN
+
+1. Ensure all machines are on the same subnet (example `192.168.1.x`).
+2. On each machine, run:
 
 ```powershell
-New-NetFirewallRule -DisplayName "RAG Frontend" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow
-New-NetFirewallRule -DisplayName "RAG Gateway"  -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+ipconfig
 ```
 
-### Client machines
+Record:
+- Docker Host IPv4 (example `192.168.1.50`)
+- Ollama Host IPv4 (example `192.168.1.60`)
 
-- Browser only: `http://<host-lan-ip>:3000`
-- The frontend is built with `NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000`. For **pure LAN clients**, that URL must match how **their** browser reaches the gateway. If you need LAN access from other PCs, rebuild the frontend with a build arg / env pointing to `http://<host-lan-ip>:8000` or serve behind a reverse proxy.
+### Step 2 — Open required Windows Firewall ports
+
+Run these on the **Docker Host** in Administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "RAG Frontend 3000" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow
+New-NetFirewallRule -DisplayName "RAG Gateway 8000"  -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+```
+
+If using a separate Ollama Host, run this on the **Ollama Host**:
+
+```powershell
+New-NetFirewallRule -DisplayName "Ollama 11434" -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Allow
+```
+
+### Step 3 — Configure Ollama host for LAN access (if used)
+
+On the **Ollama Host**:
+
+1. Install Ollama.
+2. Pull required models:
+
+```powershell
+ollama pull gemma3:4b
+ollama pull llava
+```
+
+3. Start Ollama bound to all interfaces (LAN reachable):
+
+```powershell
+$env:OLLAMA_HOST="0.0.0.0:11434"
+ollama serve
+```
+
+4. Verify from the same machine:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:11434/api/tags
+```
+
+### Step 4 — Configure `.env` on Docker Host
+
+On **Machine A**, set:
+
+```env
+# Required
+GEMINI_API_KEY=...
+
+# Optional cloud LLM
+GROQ_API_KEY=...
+
+# If Ollama runs on a separate GPU machine:
+OLLAMA_URL=http://<ollama-host-ip>:11434
+
+# Vision fallback behavior
+VISION_ORDER=ollama_then_gemini
+GEMINI_VISION_MODEL=gemini-2.0-flash
+OLLAMA_VISION_MODEL=llava
+```
+
+Fallback modes:
+- `VISION_ORDER=gemini_only` if Ollama is unavailable.
+- `VISION_ORDER=ollama_only` for fully local vision.
+
+### Step 5 — Start stack on Docker Host
+
+```powershell
+docker compose up --build -d
+```
+
+### Step 6 — Validate connectivity before users join
+
+On **Docker Host**:
+
+```powershell
+docker compose ps
+Invoke-WebRequest http://localhost:3000
+Invoke-WebRequest http://localhost:8000/health
+```
+
+From a **client machine**:
+
+```powershell
+Test-NetConnection <docker-host-ip> -Port 3000
+Test-NetConnection <docker-host-ip> -Port 8000
+```
+
+If using separate Ollama Host, from **Docker Host**:
+
+```powershell
+Invoke-WebRequest http://<ollama-host-ip>:11434/api/tags
+```
+
+### Step 7 — Access URL for all users
+
+- Clients open: `http://<docker-host-ip>:3000`
+- The frontend now auto-targets gateway on the same host IP (`:8000`), so no rebuild is required for LAN clients.
+
+### Step 8 — Production stability recommendations (Windows LAN)
+
+- Reserve static DHCP leases for Docker Host and Ollama Host.
+- Keep all machines on the same Windows network profile (`Private` preferred).
+- Avoid VPN on host machines during LAN use.
+- Keep Docker Desktop and Ollama running before clients connect.
 
 ---
 
