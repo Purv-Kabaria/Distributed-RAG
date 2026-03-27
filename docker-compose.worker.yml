@@ -1,0 +1,31 @@
+services:
+  ingestion-worker:
+    build:
+      context: ./ingestion-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Pointing entirely to your central server
+      - REDIS_URL=redis://10.123.252.181:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
+      - EMBEDDING_SERVICE_URL=http://10.123.252.181:8002
+      - UPLOAD_DIR=/uploads
+      - WHISPER_MODEL_SIZE=small
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+
+  embedding-worker:
+    build:
+      context: ./embedding-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # Pointing entirely to your central server
+      - REDIS_URL=redis://10.123.252.181:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
+      - VECTOR_STORE_URL=http://10.123.252.181:8003
+      - UPLOAD_DIR=/uploads
+      - WORKER_CONCURRENCY=2
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_URL=http://10.123.252.181:11434
+      - OLLAMA_VISION_MODEL=llava
+      - VISION_ORDER=ollama_then_gemini

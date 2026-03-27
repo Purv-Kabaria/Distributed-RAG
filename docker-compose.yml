@@ -99,7 +99,7 @@ services:
       - uploads-data:/uploads
     environment:
       - REDIS_URL=redis://redis:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
       - EMBEDDING_SERVICE_URL=http://embedding-worker:8002
       - UPLOAD_DIR=/uploads
       - OLLAMA_URL=${OLLAMA_URL:-}
@@ -132,9 +132,9 @@ services:
     volumes:
       - uploads-data:/uploads
     environment:
-      - REDIS_URL=redis://redis:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
-      - VECTOR_STORE_URL=http://vector-store:8003
+      - REDIS_URL=redis://10.123.252.181:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
+      - VECTOR_STORE_URL=http://10.123.252.181:8003
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - UPLOAD_DIR=/uploads
       - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-2}
