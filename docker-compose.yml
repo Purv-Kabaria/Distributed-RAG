@@ -1,0 +1,224 @@
+networks:
+  rag-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:
+  qdrant-data:
+  uploads-data:
+
+services:
+  # ─── Infrastructure ───────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./shared/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpassword
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ─── Component 1: API Gateway ─────────────────────────────────────────────────
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [rag-net]
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads-data:/uploads
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - INGESTION_SERVICE_URL=http://ingestion-worker:8001
+      - QUERY_SERVICE_URL=http://query-service:8004
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - UPLOAD_DIR=/uploads
+      - SECRET_KEY=${SECRET_KEY:-distributed-rag-secret-2025}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Component 2: Ingestion Worker ────────────────────────────────────────────
+
+  ingestion-worker:
+    build:
+      context: ./ingestion-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - uploads-data:/uploads
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - EMBEDDING_SERVICE_URL=http://embedding-worker:8002
+      - UPLOAD_DIR=/uploads
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
+      - VIDEO_VISUAL_MAX_FRAMES=${VIDEO_VISUAL_MAX_FRAMES:-6}
+      - VIDEO_VISUAL_INTERVAL_SEC=${VIDEO_VISUAL_INTERVAL_SEC:-45}
+      - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-2.0-flash}
+      - VISION_ORDER=${VISION_ORDER:-ollama_then_gemini}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Component 3: Embedding Worker ────────────────────────────────────────────
+
+  embedding-worker:
+    build:
+      context: ./embedding-worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [rag-net]
+    volumes:
+      - uploads-data:/uploads
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - VECTOR_STORE_URL=http://vector-store:8003
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - UPLOAD_DIR=/uploads
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vector-store:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Component 4: Vector Store Service ───────────────────────────────────────
+
+  vector-store:
+    build:
+      context: ./vector-store
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [rag-net]
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Component 5: Query Service ───────────────────────────────────────────────
+
+  query-service:
+    build:
+      context: ./query-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [rag-net]
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - VECTOR_STORE_URL=http://vector-store:8003
+      - EMBEDDING_SERVICE_URL=http://embedding-worker:8002
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vector-store:
+        condition: service_healthy
+      embedding-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8004/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Frontend ─────────────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000
+    restart: unless-stopped
+    networks: [rag-net]
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000
+    depends_on:
+      gateway:
+        condition: service_healthy
