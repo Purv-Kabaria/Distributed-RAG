@@ -15,6 +15,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     networks: [rag-net]
+    ports:
+      - "0.0.0.0:6379:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
@@ -28,6 +30,8 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     networks: [rag-net]
+    ports:
+      - "0.0.0.0:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./shared/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -65,7 +69,7 @@ services:
     restart: unless-stopped
     networks: [rag-net]
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     volumes:
       - uploads-data:/uploads
     environment:
@@ -99,7 +103,7 @@ services:
       - uploads-data:/uploads
     environment:
       - REDIS_URL=redis://redis:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
       - EMBEDDING_SERVICE_URL=http://embedding-worker:8002
       - UPLOAD_DIR=/uploads
       - OLLAMA_URL=${OLLAMA_URL:-}
@@ -132,9 +136,9 @@ services:
     volumes:
       - uploads-data:/uploads
     environment:
-      - REDIS_URL=redis://10.123.252.181:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
-      - VECTOR_STORE_URL=http://10.123.252.181:8003
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
+      - VECTOR_STORE_URL=http://vector-store:8003
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - UPLOAD_DIR=/uploads
       - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-2}
@@ -159,6 +163,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     networks: [rag-net]
+    ports:
+      - "0.0.0.0:8003:8003"
     environment:
       - QDRANT_URL=http://qdrant:6333
       - POSTGRES_URL=postgresql://raguser:ragpassword@postgres:5432/ragdb
@@ -211,10 +217,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_GATEWAY_URL=${NEXT_PUBLIC_GATEWAY_URL:-http://${PUBLIC_HOST:-localhost}:8000}
     restart: unless-stopped
     networks: [rag-net]
     ports:
-      - "3000:3000"
+      - "0.0.0.0:3000:3000"
+    environment:
+      - NEXT_PUBLIC_GATEWAY_URL=${NEXT_PUBLIC_GATEWAY_URL:-http://${PUBLIC_HOST:-localhost}:8000}
     depends_on:
       gateway:
         condition: service_healthy

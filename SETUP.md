@@ -283,6 +283,7 @@ GEMINI_API_KEY=...
 Optional:
 
 ```env
+PUBLIC_HOST=192.168.1.50
 GROQ_API_KEY=...
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_VISION_MODEL=llava
@@ -295,22 +296,15 @@ WORKER_CONCURRENCY=2
 SECRET_KEY=distributed-rag-secret-2025
 ```
 
+`PUBLIC_HOST` is the single knob for LAN access: the frontend build uses `http://${PUBLIC_HOST}:8000` unless you set `NEXT_PUBLIC_GATEWAY_URL` to a full URL (HTTPS or custom port).
+
 ---
 
 ## 8) Docker Compose Notes (Important)
 
-Current `docker-compose.yml` includes machine-specific host IP values in some service env vars (for example `10.123.252.181` in multiple places).
-
-Before team rollout, ensure these are correct for your environment:
-
-- `POSTGRES_URL` and `REDIS_URL` entries in services should be reachable from those containers.
-- `VECTOR_STORE_URL` in `embedding-worker` should target a reachable vector-store endpoint.
-- `NEXT_PUBLIC_GATEWAY_URL` in `frontend` currently points to a fixed host IP.
-
-Recommended for portability:
-
-- Prefer internal service DNS names (`postgres`, `redis`, `vector-store`) for container-to-container communication.
-- Use LAN host IP only where browser clients or cross-machine hosts require it.
+- **Inside the stack**, services use Docker DNS names (`postgres`, `redis`, `vector-store`, `embedding-worker`, etc.). Do not hardcode your LAN IP there unless you split services across machines.
+- **Browsers and Ollama tab** need a reachable gateway URL: set `PUBLIC_HOST` (or `NEXT_PUBLIC_GATEWAY_URL`) in `.env` once per machine or team.
+- **Remote workers** (`docker-compose.worker.yml`): set `PUBLIC_HOST` to the central server’s LAN IP so workers can reach Redis, Postgres, and vector-store on that host. Ensure Windows Firewall allows those ports on the central server.
 
 ---
 

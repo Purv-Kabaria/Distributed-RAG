@@ -1,8 +1,10 @@
-const BASE =
-  process.env.NEXT_PUBLIC_GATEWAY_URL ||
-  (typeof window !== "undefined"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : "http://localhost:8000");
+const isBrowser = typeof window !== "undefined";
+
+// If in browser, use the IP the user typed in the URL bar. 
+// If rendering on the server inside Docker, use the internal Docker network name.
+const BASE = isBrowser 
+  ? `http://${window.location.hostname}:8000` 
+  : "http://gateway:8000";
 
 export interface Document {
   id: string;
@@ -115,7 +117,8 @@ export async function getQueueStats(): Promise<QueueStats> {
 }
 
 export async function getModels(): Promise<{ providers: ModelProvider[] }> {
-  return fetch(`${BASE.replace("8000", "8004")}/api/models`)
+  // Try calling the gateway proxy first
+  return fetch(`${BASE}/api/models`)
     .then((r) => r.json())
     .catch(() => ({ providers: [] }));
 }

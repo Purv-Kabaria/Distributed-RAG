@@ -1,3 +1,6 @@
+# Optional: run extra ingestion/embedding workers on another machine pointing at the central stack.
+# Set PUBLIC_HOST in .env to the LAN IP of the machine running docker compose (redis/postgres/vector-store).
+
 services:
   ingestion-worker:
     build:
@@ -5,13 +8,18 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      # Pointing entirely to your central server
-      - REDIS_URL=redis://10.123.252.181:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
-      - EMBEDDING_SERVICE_URL=http://10.123.252.181:8002
+      - REDIS_URL=redis://${PUBLIC_HOST:-localhost}:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@${PUBLIC_HOST:-localhost}:5432/ragdb
+      - EMBEDDING_SERVICE_URL=http://${PUBLIC_HOST:-localhost}:8002
       - UPLOAD_DIR=/uploads
       - WHISPER_MODEL_SIZE=small
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_URL=${OLLAMA_URL:-}
+      - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
+      - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-2.0-flash}
+      - VISION_ORDER=${VISION_ORDER:-ollama_then_gemini}
+      - VIDEO_VISUAL_MAX_FRAMES=${VIDEO_VISUAL_MAX_FRAMES:-6}
+      - VIDEO_VISUAL_INTERVAL_SEC=${VIDEO_VISUAL_INTERVAL_SEC:-45}
 
   embedding-worker:
     build:
@@ -19,13 +27,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      # Pointing entirely to your central server
-      - REDIS_URL=redis://10.123.252.181:6379
-      - POSTGRES_URL=postgresql://raguser:ragpassword@10.123.252.181:5432/ragdb
-      - VECTOR_STORE_URL=http://10.123.252.181:8003
+      - REDIS_URL=redis://${PUBLIC_HOST:-localhost}:6379
+      - POSTGRES_URL=postgresql://raguser:ragpassword@${PUBLIC_HOST:-localhost}:5432/ragdb
+      - VECTOR_STORE_URL=http://${PUBLIC_HOST:-localhost}:8003
       - UPLOAD_DIR=/uploads
       - WORKER_CONCURRENCY=2
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - OLLAMA_URL=http://10.123.252.181:11434
-      - OLLAMA_VISION_MODEL=llava
-      - VISION_ORDER=ollama_then_gemini
