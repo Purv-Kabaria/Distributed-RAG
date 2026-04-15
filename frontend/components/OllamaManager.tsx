@@ -6,7 +6,11 @@ import {
   RefreshCw, Play, Server, Package, Zap, ChevronRight
 } from "lucide-react";
 
-const BASE = process.env.NEXT_PUBLIC_GATEWAY_URL || "http://localhost:8000";
+const BASE =
+  process.env.NEXT_PUBLIC_GATEWAY_URL ||
+  (typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:8000`
+    : "http://gateway:8000");
 
 const RECOMMENDED_MODELS = [
   { name: "llama3.2",         size: "2.0 GB", desc: "Meta Llama 3.2 3B — fast, great for most tasks" },

@@ -15,10 +15,13 @@ interface UploadItem {
 export default function UploadPanel({ onUploaded }: { onUploaded?: () => void }) {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [panelError, setPanelError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const addFiles = useCallback((files: FileList | File[]) => {
     const arr = Array.from(files);
+    if (!arr.length) return;
+    setPanelError(null);
     const newItems: UploadItem[] = arr.map((f) => ({
       id: Math.random().toString(36).slice(2),
       file: f,
@@ -42,6 +45,7 @@ export default function UploadPanel({ onUploaded }: { onUploaded?: () => void })
       onUploaded?.();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Upload failed";
+      setPanelError(msg);
       setItems((prev) =>
         prev.map((i) =>
           i.id === item.id ? { ...i, state: "error", error: msg } : i
@@ -61,6 +65,9 @@ export default function UploadPanel({ onUploaded }: { onUploaded?: () => void })
 
   const removeItem = (id: string) =>
     setItems((prev) => prev.filter((i) => i.id !== id));
+  const retryFailed = () => {
+    items.filter((i) => i.state === "error").forEach((i) => uploadFile(i));
+  };
 
   const ICON: Record<UploadItem["state"], React.ReactNode> = {
     pending:   <Loader2 size={14} className="text-[var(--color-text-muted)] animate-spin" />,
@@ -79,7 +86,7 @@ export default function UploadPanel({ onUploaded }: { onUploaded?: () => void })
         onClick={() => inputRef.current?.click()}
         className={`
           relative cursor-pointer rounded-[var(--radius-card)] border-2 border-dashed
-          transition-all duration-200 p-8 text-center select-none
+          transition-all duration-200 p-8 text-center select-none glass-panel
           ${dragging
             ? "border-[var(--color-brand)] bg-[#1a1a2e] shadow-[var(--shadow-glow)]"
             : "border-[var(--color-bg-border)] hover:border-[var(--color-brand)] hover:bg-[#16181f]"
@@ -109,7 +116,7 @@ export default function UploadPanel({ onUploaded }: { onUploaded?: () => void })
           {items.map((item) => (
             <li
               key={item.id}
-              className="flex items-center gap-3 rounded-lg bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] px-3 py-2 animate-slide-up"
+              className="flex items-center gap-3 rounded-lg bg-[var(--color-bg-elevated)]/80 border border-[var(--color-bg-border)] px-3 py-2 animate-slide-up"
             >
               <File size={14} className="shrink-0 text-[var(--color-text-muted)]" />
               <span className="flex-1 truncate text-xs text-[var(--color-text-secondary)]">
@@ -135,6 +142,20 @@ export default function UploadPanel({ onUploaded }: { onUploaded?: () => void })
             </li>
           ))}
         </ul>
+      )}
+      {panelError && (
+        <div className="rounded-lg border border-red-900/40 bg-[#1e0808] px-3 py-2 text-xs text-[var(--color-danger)]">
+          {panelError}
+        </div>
+      )}
+      {items.some((i) => i.state === "error") && (
+        <button
+          type="button"
+          onClick={retryFailed}
+          className="text-xs text-[var(--color-brand-hover)] hover:text-white"
+        >
+          Retry failed uploads
+        </button>
       )}
     </div>
   );

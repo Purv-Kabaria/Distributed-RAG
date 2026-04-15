@@ -28,6 +28,10 @@ GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
 VISION_ORDER = os.getenv("VISION_ORDER", "ollama_then_gemini").strip().lower()
 VIDEO_VISUAL_MAX_FRAMES = int(os.getenv("VIDEO_VISUAL_MAX_FRAMES", "6"))
 VIDEO_VISUAL_INTERVAL_SEC = float(os.getenv("VIDEO_VISUAL_INTERVAL_SEC", "45"))
+WORKER_CONCURRENCY = int(os.getenv("INGESTION_CONCURRENCY", "2"))
+QUEUE_POP_TIMEOUT_SEC = int(os.getenv("INGESTION_QUEUE_POP_TIMEOUT_SEC", "2"))
+FILE_RETRY_MAX = int(os.getenv("INGESTION_FILE_RETRY_MAX", "6"))
+FILE_RETRY_DELAY_SEC = float(os.getenv("INGESTION_FILE_RETRY_DELAY_SEC", "1.5"))
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
@@ -53,8 +57,9 @@ async def startup():
     if gk:
         gemini_client = genai.Client(api_key=gk)
         log.info("Gemini API vision fallback enabled")
-    asyncio.create_task(worker_loop())
-    log.info("Ingestion worker started ✓")
+    for worker_id in range(WORKER_CONCURRENCY):
+        asyncio.create_task(worker_loop(worker_id))
+    log.info(f"Ingestion worker started with {WORKER_CONCURRENCY} consumers ✓")
 
 
 @app.on_event("shutdown")
@@ -414,10 +419,18 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return chunks
 
 
+def sanitize_chunk_content(text: str) -> str:
+    t = (text or "").replace("\x00", "")
+    return t
+
+
 async def save_chunks(doc_id: str, chunk_rows: list[tuple[str, dict]]) -> list[str]:
     ids = []
     async with db_pool.acquire() as conn:
         for i, (content, extra) in enumerate(chunk_rows):
+            clean_content = sanitize_chunk_content(content)
+            if not clean_content.strip():
+                continue
             chunk_id = str(uuid.uuid4())
             await conn.execute(
                 """INSERT INTO chunks (id, document_id, chunk_index, content, token_count, extra)
@@ -425,14 +438,14 @@ async def save_chunks(doc_id: str, chunk_rows: list[tuple[str, dict]]) -> list[s
                 chunk_id,
                 doc_id,
                 i,
-                content,
-                len(content.split()),
+                clean_content,
+                len(clean_content.split()),
                 json.dumps(extra or {}),
             )
             ids.append(chunk_id)
         await conn.execute(
             "UPDATE documents SET chunk_count=$1, updated_at=NOW() WHERE id=$2",
-            len(chunk_rows),
+            len(ids),
             doc_id,
         )
     return ids
@@ -454,10 +467,23 @@ async def process_job(job: dict):
     filename = job["filename"]
     file_type = job["file_type"]
     file_path = Path(job["file_path"])
+    retries = int(job.get("_ingestion_retries", 0))
 
     log.info(f"Processing doc={doc_id} type={file_type}")
 
     try:
+        if not file_path.exists():
+            if retries < FILE_RETRY_MAX:
+                job["_ingestion_retries"] = retries + 1
+                await redis_client.rpush("ingestion:queue", json.dumps(job))
+                await asyncio.sleep(FILE_RETRY_DELAY_SEC)
+                log.warning(
+                    f"doc={doc_id} file not found at {file_path}; requeued ({retries + 1}/{FILE_RETRY_MAX})"
+                )
+                return
+            await set_status(doc_id, "failed", f"File not accessible to ingestion workers: {file_path}")
+            return
+
         await set_status(doc_id, "extracting")
         chunk_rows: list[tuple[str, dict]] = []
         is_multimodal = file_type in ("image", "audio", "video")
@@ -580,15 +606,15 @@ async def set_status(doc_id: str, status: str, error: str = None):
         )
 
 
-async def worker_loop():
-    log.info("Worker loop started, listening on ingestion:queue")
+async def worker_loop(worker_id: int):
+    log.info(f"Worker-{worker_id} loop started, listening on ingestion:queue")
     while True:
         try:
-            item = await redis_client.brpop("ingestion:queue", timeout=2)
+            item = await redis_client.brpop("ingestion:queue", timeout=QUEUE_POP_TIMEOUT_SEC)
             if item:
                 _, raw = item
                 job = json.loads(raw)
                 await process_job(job)
         except Exception as e:
-            log.exception(f"Worker loop error: {e}")
+            log.exception(f"Worker-{worker_id} loop error: {e}")
             await asyncio.sleep(1)

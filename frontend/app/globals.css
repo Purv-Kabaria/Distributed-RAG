@@ -27,10 +27,29 @@
 
   --shadow-card: 0 0 0 1px #2a2d38, 0 4px 24px rgba(0, 0, 0, 0.4);
   --shadow-glow: 0 0 20px rgba(99, 102, 241, 0.25);
+  --shadow-soft: 0 8px 30px rgba(0, 0, 0, 0.35);
 }
 
 * {
   box-sizing: border-box;
+}
+
+button,
+a,
+summary,
+select,
+label[for],
+input[type="checkbox"],
+input[type="radio"],
+[role="button"] {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled,
+input:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
 }
 
 html {
@@ -38,6 +57,14 @@ html {
   color: var(--color-text-primary);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(99, 102, 241, 0.2), transparent 60%),
+    radial-gradient(900px 400px at 100% 0%, rgba(56, 189, 248, 0.12), transparent 65%),
+    var(--color-bg-base);
 }
 
 ::-webkit-scrollbar {
@@ -70,7 +97,13 @@ html {
   100% { background-position: 400px 0; }
 }
 
+@keyframes float-in {
+  0% { opacity: 0; transform: translateY(14px) scale(0.98); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
 .animate-slide-up { animation: slide-up 0.25s ease forwards; }
+.animate-float-in { animation: float-in 0.35s ease forwards; }
 
 .skeleton {
   background: linear-gradient(90deg,
@@ -79,4 +112,11 @@ html {
     var(--color-bg-elevated) 75%);
   background-size: 400px 100%;
   animation: shimmer 1.4s infinite;
+}
+
+.glass-panel {
+  background: linear-gradient(160deg, rgba(30, 32, 40, 0.9), rgba(22, 24, 31, 0.82));
+  border: 1px solid rgba(82, 89, 109, 0.35);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(8px);
 }

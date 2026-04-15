@@ -1,15 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { Network, HardDrive, MessageSquare, LayoutDashboard, Server } from "lucide-react";
+import { Network, HardDrive, MessageSquare, LayoutDashboard, Server, Globe } from "lucide-react";
 import UploadPanel from "@/components/UploadPanel";
 import DocumentList from "@/components/DocumentList";
 import QueryPanel from "@/components/QueryPanel";
 import SystemMonitor from "@/components/SystemMonitor";
 import ArchDiagram from "@/components/ArchDiagram";
 import OllamaManager from "@/components/OllamaManager";
+import WebsiteScraper from "@/components/WebsiteScraper";
 
-type Tab = "query" | "docs" | "ollama" | "arch";
+type Tab = "query" | "docs" | "scrape" | "ollama" | "arch";
 
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState<Tab>("query");
@@ -20,6 +21,7 @@ export default function HomePage() {
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "query",  label: "Query",     icon: <MessageSquare size={14} /> },
     { id: "docs",   label: "Documents", icon: <HardDrive size={14} /> },
+    { id: "scrape", label: "Scrape",    icon: <Globe size={14} /> },
     { id: "ollama", label: "Ollama",    icon: <Server size={14} /> },
     { id: "arch",   label: "System",    icon: <LayoutDashboard size={14} /> },
   ];
@@ -32,9 +34,9 @@ export default function HomePage() {
   return (
     <div className="flex flex-col h-screen bg-[var(--color-bg-base)]">
       {/* ── Header ── */}
-      <header className="flex items-center justify-between px-6 py-3 border-b border-[var(--color-bg-border)] bg-[var(--color-bg-surface)] shrink-0">
+      <header className="flex items-center justify-between px-6 py-3 border-b border-[var(--color-bg-border)] bg-[var(--color-bg-surface)]/80 backdrop-blur-md shrink-0">
         <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-[var(--color-brand)] flex items-center justify-center">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--color-brand)] to-[#4f46e5] flex items-center justify-center shadow-[var(--shadow-glow)]">
             <Network size={15} className="text-white" />
           </div>
           <div>
@@ -47,7 +49,7 @@ export default function HomePage() {
           </div>
         </div>
 
-        <nav className="flex gap-1 bg-[var(--color-bg-elevated)] rounded-xl p-1 border border-[var(--color-bg-border)]">
+        <nav className="flex gap-1 bg-[var(--color-bg-elevated)]/80 rounded-xl p-1 border border-[var(--color-bg-border)]">
           {tabs.map((t) => (
             <button
               key={t.id}
@@ -65,13 +67,13 @@ export default function HomePage() {
       </header>
 
       {/* ── Body ── */}
-      <div className="flex-1 min-h-0 overflow-hidden">
+      <div className="flex-1 min-h-0 overflow-hidden px-4 pb-4">
 
         {/* Query Tab */}
         {activeTab === "query" && (
-          <div className="h-full grid grid-cols-[320px_1fr] divide-x divide-[var(--color-bg-border)]">
+          <div className="h-full min-h-0 grid grid-cols-[320px_1fr] divide-x divide-[var(--color-bg-border)] rounded-2xl border border-[var(--color-bg-border)] glass-panel overflow-hidden animate-float-in">
             {/* Left: upload + monitor */}
-            <div className="flex flex-col h-full overflow-hidden bg-[var(--color-bg-surface)]">
+            <div className="flex flex-col h-full overflow-hidden bg-[var(--color-bg-surface)]/60">
               <div className="p-4 border-b border-[var(--color-bg-border)]">
                 <h2 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)] mb-3">
                   Upload Documents
@@ -84,7 +86,7 @@ export default function HomePage() {
             </div>
 
             {/* Right: chat */}
-            <div className="flex flex-col h-full bg-[var(--color-bg-base)]">
+            <div className="flex flex-col h-full min-h-0 overflow-hidden bg-[var(--color-bg-base)]/40">
               <QueryPanel preselectedOllamaModel={selectedOllamaModel} />
             </div>
           </div>
@@ -92,15 +94,29 @@ export default function HomePage() {
 
         {/* Documents Tab */}
         {activeTab === "docs" && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-6 animate-float-in">
             <div className="max-w-3xl mx-auto space-y-6">
-              <div className="rounded-[var(--radius-card)] bg-[var(--color-bg-surface)] border border-[var(--color-bg-border)] p-5">
+              <div className="rounded-[var(--radius-card)] glass-panel p-5">
                 <h2 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)] mb-4">
                   Upload
                 </h2>
                 <UploadPanel onUploaded={() => setRefreshSignal((s) => s + 1)} />
               </div>
-              <div className="rounded-[var(--radius-card)] bg-[var(--color-bg-surface)] border border-[var(--color-bg-border)] p-5">
+              <div className="rounded-[var(--radius-card)] glass-panel p-5">
+                <h2 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)] mb-4">
+                  Document Library
+                </h2>
+                <DocumentList refreshSignal={refreshSignal} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === "scrape" && (
+          <div className="h-full overflow-y-auto p-6 animate-float-in">
+            <div className="max-w-3xl mx-auto space-y-6">
+              <WebsiteScraper onQueued={() => setRefreshSignal((s) => s + 1)} />
+              <div className="rounded-[var(--radius-card)] glass-panel p-5">
                 <h2 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)] mb-4">
                   Document Library
                 </h2>
@@ -112,7 +128,7 @@ export default function HomePage() {
 
         {/* Ollama Tab */}
         {activeTab === "ollama" && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-6 animate-float-in">
             <div className="max-w-2xl mx-auto space-y-4">
               <div>
                 <h2 className="text-base font-bold text-[var(--color-text-primary)]">Ollama Model Manager</h2>
@@ -127,12 +143,12 @@ export default function HomePage() {
 
         {/* System Tab */}
         {activeTab === "arch" && (
-          <div className="h-full overflow-y-auto p-6">
+          <div className="h-full overflow-y-auto p-6 animate-float-in">
             <div className="max-w-3xl mx-auto space-y-6">
               <ArchDiagram />
               <SystemMonitor />
 
-              <div className="rounded-[var(--radius-card)] bg-[var(--color-bg-surface)] border border-[var(--color-bg-border)] p-5 space-y-4">
+              <div className="rounded-[var(--radius-card)] glass-panel p-5 space-y-4">
                 <h3 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)]">
                   Component Reference
                 </h3>
@@ -156,7 +172,7 @@ export default function HomePage() {
                 ))}
               </div>
 
-              <div className="rounded-[var(--radius-card)] bg-[var(--color-bg-surface)] border border-[var(--color-bg-border)] p-5">
+              <div className="rounded-[var(--radius-card)] glass-panel p-5">
                 <h3 className="text-xs font-semibold uppercase tracking-widest text-[var(--color-text-muted)] mb-3">Data Flow</h3>
                 <div className="space-y-2">
                   {[

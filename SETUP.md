@@ -4,263 +4,140 @@ This document is a code-accurate setup and operations guide for the current repo
 
 ---
 
-## 1) System at a Glance
+## 1) System Overview
 
-This project implements a distributed RAG pipeline with five server-side application components:
+This project is a distributed RAG system with five backend components:
 
-1. `gateway` (API entry + upload + query proxy + ollama proxy)
-2. `ingestion-worker` (extraction/OCR/STT/vision chunk production)
-3. `embedding-worker` (Gemini embeddings + vector upsert orchestration)
-4. `vector-store` (sole Qdrant access service)
-5. `query-service` (retrieve + prompt build + LLM call)
+1. `gateway` - API entrypoint, uploads, website scraping, query proxy, ollama proxy, metrics.
+2. `ingestion-worker` - extraction/chunking for text/pdf/image/audio/video.
+3. `embedding-worker` - Gemini embeddings + vector upsert orchestration.
+4. `vector-store` - sole Qdrant access service.
+5. `query-service` - query-time retrieve + prompt + LLM response.
 
-Shared infrastructure services:
+Shared infrastructure:
 
-- `redis` (queue + cache)
-- `postgres` (metadata)
-- `qdrant` (vector DB)
-- `frontend` (client UI; does not count toward 5 components)
-
----
-
-## 2) Lab Mandate Compliance
-
-### 5-Component rule
-
-- Distinct server components: `gateway`, `ingestion-worker`, `embedding-worker`, `vector-store`, `query-service`.
-- Each runs in its own container with healthchecks in `docker-compose.yml`.
-
-### Functional decomposition
-
-- `gateway`: upload/list/delete/status and query proxy.
-- `ingestion-worker`: extract/chunk from files and enqueue embedding jobs.
-- `embedding-worker`: embed chunks and track embedding job progress.
-- `vector-store`: upsert/search/delete vectors in Qdrant.
-- `query-service`: query-time embedding, retrieval, prompting, and LLM response.
-
-### Inter-component dependency
-
-End-to-end upload + query requires chained service interaction:
-
-- Upload path: frontend -> gateway -> Redis `ingestion:queue` -> ingestion-worker -> Redis `embedding:queue` -> embedding-worker -> vector-store -> Qdrant.
-- Query path: frontend -> gateway -> query-service -> embedding-worker (`/api/embed/text`) + vector-store (`/api/vectors/search`) -> Ollama or Groq.
-
-### No fat clients
-
-- Frontend is only UI and API caller.
-- Processing, storage, retrieval, and generation occur server-side.
-
-### Decoupled data
-
-- Qdrant is only accessed via `vector-store`.
-- Postgres holds metadata (`documents`, `chunks`, `embedding_jobs`, `query_logs`) and is used by multiple services for pipeline state.
-- Redis is used for asynchronous queue decoupling and search cache.
+- `redis` - async queues + cache + client heartbeat state.
+- `postgres` - metadata state.
+- `qdrant` - vector database.
+- `frontend` - UI only (not counted as one of the five components).
 
 ---
 
-## 3) Runtime Architecture Details
+## 2) End-to-End Data Flow
 
-### `gateway` (`gateway/main.py`)
+### Upload flow
 
-Responsibilities:
+`frontend -> gateway -> ingestion:queue -> ingestion-worker -> embedding:queue -> embedding-worker -> vector-store -> qdrant`
 
-- Accept uploads (`/api/documents/upload`) with MIME + size validation.
-- Insert initial `documents` row with status `queued`.
-- Push ingestion jobs into Redis `ingestion:queue`.
-- List/status/delete documents.
-- Proxy queries to `query-service`.
-- Aggregate system health (`/api/system/status`).
-- Expose queue depths (`/api/stats/queue`).
-- Proxy Ollama model management and test APIs (`/api/ollama/*`).
+### Website scrape flow
 
-Important notes:
+`frontend (Scrape tab) -> gateway /api/websites/scrape -> generated text doc -> ingestion:queue -> ... same embedding pipeline`
 
-- Upload size cap: 200 MB.
-- Supported MIME buckets: text, image, audio, video, pdf.
-- On document delete, gateway also calls vector-store delete by `doc_id`.
+### Query flow
 
-### `ingestion-worker` (`ingestion-worker/main.py`)
+`frontend -> gateway /api/query -> query-service -> embedding-worker (/api/embed/text) + vector-store (/api/vectors/search) -> groq/ollama`
 
-Responsibilities:
+---
 
-- BRPOP `ingestion:queue`.
-- Extract and normalize content by file type.
-- Save chunks in Postgres `chunks`.
-- Update `documents` statuses.
-- LPUSH embedding jobs to `embedding:queue`.
+## 3) Runtime Responsibilities
 
-File-type behavior:
+### `gateway`
 
-- `text`: `read_text`.
-- `pdf`: PyMuPDF text extraction.
-- `image`: Tesseract OCR + visual caption backend(s).
-- `audio`: faster-whisper transcription with timestamps.
-- `video`: optional visual frame captions + audio transcription with timestamps.
+- Upload/list/status/delete documents.
+- Query proxy.
+- Ollama model list/pull/delete/test proxy.
+- Website scraping endpoint (`/api/websites/scrape`).
+- Aggregated health/queue/overview metrics.
+- Client heartbeat intake for multi-device visibility.
 
-Vision backends:
+### `ingestion-worker`
 
-- Ollama (`OLLAMA_URL`, `OLLAMA_VISION_MODEL`)
-- Gemini fallback (`GEMINI_API_KEY`, `GEMINI_VISION_MODEL`)
-- Selection by `VISION_ORDER`:
-  - `ollama_then_gemini`
-  - `gemini_only`
-  - `ollama_only`
+- Consumes `ingestion:queue`.
+- Extracts content by file type:
+  - text, pdf
+  - image (OCR + vision caption)
+  - audio/video (Whisper timestamps + optional vision frames)
+- Stores chunks in Postgres.
+- Pushes embedding jobs to `embedding:queue`.
+- Supports concurrent consumers (`INGESTION_CONCURRENCY`).
+- Retries jobs when file path is temporarily not accessible (`INGESTION_FILE_RETRY_*`).
 
-Chunk metadata:
+### `embedding-worker`
 
-- `chunks.extra` JSONB stores fields such as:
-  - `time_start_sec`
-  - `time_end_sec`
-  - `chunk_kind` (`transcript`, `visual_frame`, `image`)
+- Consumes `embedding:queue`.
+- Embeds chunks with Gemini embedding model.
+- Upserts vectors through `vector-store`.
+- Tracks `embedding_jobs` and document completion.
+- Provides query-time embedding endpoint (`/api/embed/text`).
+- Separates query-time embed concurrency (`QUERY_EMBED_CONCURRENCY`) from background worker concurrency (`WORKER_CONCURRENCY`).
 
-Startup migration safeguard:
+### `vector-store`
 
-- Worker runs `ALTER TABLE chunks ADD COLUMN IF NOT EXISTS extra JSONB ...` at startup for old volumes.
+- Owns Qdrant collection lifecycle and search/upsert/delete APIs.
+- Caches searches in Redis.
+- Uses deterministic point IDs derived from `chunk_id` digest.
 
-### `embedding-worker` (`embedding-worker/main.py`)
+### `query-service`
 
-Responsibilities:
+- Validates query inputs (`QUESTION_MAX_CHARS`, `TOP_K_MIN/MAX`).
+- Embeds query text via embedding-worker.
+- Retrieves context via vector-store.
+- Calls Groq or Ollama.
+- Logs query metadata to Postgres.
+- Prompt enforces English output.
 
-- BRPOP `embedding:queue`.
-- Create/update `embedding_jobs`.
-- Embed content via Gemini embedding model.
-- Upsert vectors through `vector-store`.
-- Mark `documents` as `done` when all jobs complete, otherwise `failed`.
+---
 
-Embedding logic:
-
-- Query embedding endpoint (`/api/embed/text`) defaults to `RETRIEVAL_QUERY`.
-- Document chunks embed as text with `RETRIEVAL_DOCUMENT`.
-- Native multimodal embed path exists but current flow primarily embeds extracted text/transcript/caption content.
-
-### `vector-store` (`vector-store/main.py`)
-
-Responsibilities:
-
-- Own Qdrant collection lifecycle.
-- Upsert vectors (`/api/vectors/upsert`).
-- Search vectors (`/api/vectors/search`) with optional `doc_filter`.
-- Delete vectors by document (`/api/vectors/{doc_id}`).
-- Cache search responses in Redis.
-
-Payload fields preserved in search hits:
-
-- `chunk_id`, `doc_id`, `text`, `score`
-- Optional `time_start_sec`, `time_end_sec`, `chunk_kind`, `file_type`
-
-### `query-service` (`query-service/main.py`)
-
-Responsibilities:
-
-- Accept query requests (`/api/query`).
-- Embed question via embedding-worker `/api/embed/text`.
-- Retrieve top-K context via vector-store `/api/vectors/search`.
-- Build prompt with source score and media-time hints.
-- Call selected LLM provider:
-  - `groq` (cloud)
-  - `ollama` (local or remote LAN host)
-- Insert query logs into `query_logs`.
-
-Prompt behavior:
-
-- Instructs model to use only provided context.
-- Instructs timestamp use for "when was X said/shown" style questions.
-
-### Frontend (`frontend/*`)
+## 4) Frontend Capabilities
 
 Tabs:
 
 - Query
 - Documents
+- Scrape
 - Ollama
 - System
 
-Main API wiring:
+Notable behaviors:
 
-- Most app APIs use `frontend/lib/api.ts`.
-- Ollama management UI uses `frontend/components/Ollamamanager.tsx`.
+- Query supports persistent chat, new chat, markdown answer rendering.
+- Ollama model selection in Query is dropdown-only from installed models.
+- System shows queue depth, service health, active device count, ingestion/embedding metrics.
+- Scrape tab ingests same-domain website content into the existing pipeline.
 
 ---
 
-## 4) Data Model and State Flow
+## 5) Data Model
 
 Schema source: `shared/init.sql`
 
-### Core tables
+Core tables:
 
-- `documents`: upload record + pipeline status + errors + chunk_count.
-- `chunks`: chunk text + token_count + `extra` metadata JSONB.
-- `embedding_jobs`: per chunk embedding status/attempts/errors.
-- `query_logs`: query audit with provider/model/timing/chunk usage.
-- `api_keys`: present in schema, currently unused at runtime.
+- `documents`
+- `chunks` (`extra` JSONB for timestamps/chunk kinds)
+- `embedding_jobs`
+- `query_logs`
+- `api_keys` (present, currently unused)
 
-### Status lifecycle
+Document lifecycle:
 
-`queued` -> `extracting` -> `chunking` -> `embedding` -> `done`
-
-Failure path:
-
-- Any unrecoverable stage error sets status `failed` with `error_msg`.
-
----
-
-## 5) Queues, Endpoints, and Contracts
-
-### Redis queues
-
-- `ingestion:queue` (producer: gateway, consumer: ingestion-worker)
-- `embedding:queue` (producer: ingestion-worker, consumer: embedding-worker)
-
-### High-value HTTP endpoints
-
-Gateway:
-
-- `POST /api/documents/upload`
-- `GET /api/documents`
-- `GET /api/documents/{doc_id}/status`
-- `DELETE /api/documents/{doc_id}`
-- `POST /api/query`
-- `GET /api/query/history`
-- `GET /api/stats/queue`
-- `GET /api/system/status`
-- `GET/POST/DELETE /api/ollama/*`
-
-Ingestion worker:
-
-- `GET /health`
-
-Embedding worker:
-
-- `GET /health`
-- `POST /api/embed/text`
-
-Vector store:
-
-- `GET /health`
-- `POST /api/vectors/upsert`
-- `POST /api/vectors/search`
-- `DELETE /api/vectors/{doc_id}`
-
-Query service:
-
-- `GET /health`
-- `GET /api/models`
-- `POST /api/query`
+`queued -> extracting -> chunking -> embedding -> done`  
+failure path -> `failed` with `error_msg`
 
 ---
 
 ## 6) Prerequisites (Windows)
 
-Install on machines that run services:
+Install:
 
 1. Docker Desktop (WSL2 backend recommended)
 2. Git for Windows
-3. PowerShell 7 or Windows Terminal
+3. PowerShell 7 / Windows Terminal
 
 If using Ollama:
 
-- Install Ollama on chosen host machine.
-- Pull models as needed, for example:
+- Install Ollama on local or separate LAN machine.
+- Pull required models, e.g.:
   - `ollama pull llama3.2`
   - `ollama pull llava`
 
@@ -274,227 +151,251 @@ Create `.env`:
 Copy-Item .env.example .env
 ```
 
-Set required keys:
+Required:
 
 ```env
 GEMINI_API_KEY=...
 ```
 
-Optional:
+Common optional:
 
 ```env
 PUBLIC_HOST=192.168.1.50
 GROQ_API_KEY=...
 OLLAMA_URL=http://host.docker.internal:11434
-OLLAMA_VISION_MODEL=llava
-GEMINI_VISION_MODEL=gemini-2.0-flash
-VISION_ORDER=ollama_then_gemini
-WHISPER_MODEL_SIZE=small
-VIDEO_VISUAL_MAX_FRAMES=6
-VIDEO_VISUAL_INTERVAL_SEC=45
-WORKER_CONCURRENCY=2
-SECRET_KEY=distributed-rag-secret-2025
 ```
 
-`PUBLIC_HOST` is the single knob for LAN access: the frontend build uses `http://${PUBLIC_HOST}:8000` unless you set `NEXT_PUBLIC_GATEWAY_URL` to a full URL (HTTPS or custom port).
+Key tunables:
+
+- Gateway/query/vector robustness and timeouts (`*_TIMEOUT_SEC`, retries, pool sizes).
+- Query limits (`QUESTION_MAX_CHARS`, `TOP_K_MIN/MAX`).
+- Worker scaling:
+  - `INGESTION_CONCURRENCY`
+  - `WORKER_CONCURRENCY`
+  - `QUERY_EMBED_CONCURRENCY`
+- Worker file accessibility retry:
+  - `INGESTION_FILE_RETRY_MAX`
+  - `INGESTION_FILE_RETRY_DELAY_SEC`
+
+See `.env.example` for full list and defaults.
 
 ---
 
-## 8) Docker Compose Notes (Important)
+## 8) Main Stack Run
 
-- **Inside the stack**, services use Docker DNS names (`postgres`, `redis`, `vector-store`, `embedding-worker`, etc.). Do not hardcode your LAN IP there unless you split services across machines.
-- **Browsers and Ollama tab** need a reachable gateway URL: set `PUBLIC_HOST` (or `NEXT_PUBLIC_GATEWAY_URL`) in `.env` once per machine or team.
-- **Remote workers** (`docker-compose.worker.yml`): set `PUBLIC_HOST` to the central server’s LAN IP so workers can reach Redis, Postgres, and vector-store on that host. Ensure Windows Firewall allows those ports on the central server.
-
----
-
-## 9) Build and Run
+Start everything:
 
 ```powershell
-docker compose up --build -d
+docker compose up -d --build
 ```
 
-Check services:
+Check status:
 
 ```powershell
 docker compose ps
 docker compose logs -f
 ```
 
-Health examples:
+Health URLs:
 
 - `http://localhost:8000/health` (gateway)
 - `http://localhost:3000` (frontend)
 
 ---
 
-## 10) Multi-Device Windows Connectivity (Exact Steps)
+## 9) Multi-Device Access (LAN)
 
-Use this topology:
+Recommended topology:
 
-- Machine A: Docker host (full stack)
-- Machine B: Ollama host (optional, often GPU-capable)
-- Machine C..N: browser-only clients
+- Machine A: main Docker stack host.
+- Machine B (optional): Ollama host.
+- Machine C..N: browser clients.
 
-### Step A: discover IPs
-
-On each machine:
+### A) Discover IP
 
 ```powershell
 ipconfig
 ```
 
-Use the active LAN/Wi-Fi IPv4 (not WSL adapter addresses).
+Use active LAN/Wi-Fi IPv4.
 
-### Step B: firewall rules
+### B) Open firewall ports
 
-On Docker host (Admin PowerShell):
+On main host:
 
 ```powershell
 New-NetFirewallRule -DisplayName "RAG Frontend 3000" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow
 New-NetFirewallRule -DisplayName "RAG Gateway 8000"  -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
 ```
 
-On Ollama host (if separate):
+If remote workers are used against central infra, also allow:
+
+- `5432` (Postgres)
+- `6379` (Redis)
+- `8003` (vector-store)
+
+If Ollama is separate host:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Ollama 11434" -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Allow
 ```
 
-### Step C: start Ollama for LAN (if separate host)
+### C) Client access
 
-On Ollama host:
+Open from any device:
+
+`http://<docker-host-ip>:3000`
+
+---
+
+## 10) Remote Worker Mode (`docker-compose.worker.yml`)
+
+Use this file when running extra ingestion/embedding workers on another machine.
+
+### Critical requirements
+
+1. `PUBLIC_HOST` must point to central stack host IP.
+2. Ingestion workers must access the same uploads path:
+   - set `SHARED_UPLOADS_DIR` to a shared/network path mirrored at `/uploads`.
+3. Workers are intended for ingestion + embedding only.
+
+### Run remote workers
 
 ```powershell
-$env:OLLAMA_HOST="0.0.0.0:11434"
-ollama serve
+docker compose -f docker-compose.worker.yml up -d --build
 ```
 
-Set Docker host `.env`:
+### Worker-only tuning
 
-```env
-OLLAMA_URL=http://<ollama-host-ip>:11434
+- `INGESTION_CONCURRENCY`
+- `WORKER_CONCURRENCY`
+- `QUERY_EMBED_CONCURRENCY`
+- `INGESTION_QUEUE_POP_TIMEOUT_SEC`
+- `EMBEDDING_QUEUE_POP_TIMEOUT_SEC`
+
+---
+
+## 11) High-Value Endpoints
+
+Gateway:
+
+- `POST /api/documents/upload`
+- `GET /api/documents`
+- `GET /api/documents/{doc_id}/status`
+- `DELETE /api/documents/{doc_id}`
+- `POST /api/websites/scrape`
+- `POST /api/query`
+- `GET /api/query/history`
+- `GET /api/system/status`
+- `GET /api/stats/queue`
+- `GET /api/stats/overview`
+- `POST /api/client/heartbeat`
+- `GET /api/ollama/models`
+- `POST /api/ollama/pull`
+- `DELETE /api/ollama/models/{model_name}`
+- `POST /api/ollama/test`
+
+Embedding worker:
+
+- `POST /api/embed/text`
+
+Vector store:
+
+- `POST /api/vectors/upsert`
+- `POST /api/vectors/search`
+- `DELETE /api/vectors/{doc_id}`
+
+Query service:
+
+- `GET /api/models`
+- `POST /api/query`
+
+---
+
+## 12) Maintenance Scripts
+
+### Clear full runtime state
+
+`clear_database.py`:
+
+```powershell
+python clear_database.py --yes
 ```
 
-### Step D: validate connectivity
+Clears Postgres runtime tables, Redis queues/cache/client state, Qdrant vectors, and uploaded files.
 
-From client machine:
+### Clear vector database only
+
+`clear_vector_db.py`:
+
+```powershell
+python clear_vector_db.py --yes
+```
+
+Deletes Qdrant collection and recreates it by default.
+
+---
+
+## 13) Troubleshooting
+
+### Ingestion worker fails with file not found
+
+- In remote worker mode, verify `SHARED_UPLOADS_DIR` is correctly mapped.
+- Check retry envs: `INGESTION_FILE_RETRY_MAX`, `INGESTION_FILE_RETRY_DELAY_SEC`.
+
+### Embedding backlog grows
+
+- Increase `WORKER_CONCURRENCY`.
+- Increase worker instances (main and/or remote worker compose).
+
+### Query latency spikes under load
+
+- Increase `QUERY_EMBED_CONCURRENCY`.
+- Tune query service timeouts/retries.
+
+### Ollama not available in Query tab dropdown
+
+- Verify `OLLAMA_URL`.
+- Verify models exist via Ollama tab.
+- Check gateway logs for `/api/ollama/models`.
+
+### LAN devices cannot connect
+
+- Verify `PUBLIC_HOST`.
+- Validate firewall and subnet routing.
+- Test ports from client:
 
 ```powershell
 Test-NetConnection <docker-host-ip> -Port 3000
 Test-NetConnection <docker-host-ip> -Port 8000
 ```
 
-From Docker host to Ollama host (if separate):
-
-```powershell
-Invoke-WebRequest http://<ollama-host-ip>:11434/api/tags
-```
-
-### Step E: client access URL
-
-- Open `http://<docker-host-ip>:3000`
-
----
-
-## 11) Feature Deep Dive: Media Time and Visual Understanding
-
-### Audio/video "exact time" Q&A
-
-- Whisper transcription stores timestamped lines in chunk content.
-- Chunk metadata preserves numeric ranges in seconds.
-- Query prompt instructs model to cite timestamps.
-- UI surfaces source time ranges when available.
-
-### Image/video visual understanding
-
-- Image flow combines:
-  - OCR text
-  - vision description (Ollama and/or Gemini fallback)
-- Video flow combines:
-  - frame-based visual captions
-  - speech transcription
-
-If a backend is unavailable:
-
-- `VISION_ORDER` controls fallback behavior.
-- Placeholder chunks are still generated to keep pipeline continuity.
-
----
-
-## 12) Known Pitfalls and Current Behavior
-
-1. `init.sql` runs only on first Postgres volume creation.
-   - Mitigation: ingestion startup migration for `chunks.extra`.
-
-2. Some compose env values are host-IP hardcoded.
-   - This can break when moved to a new network.
-
-3. Frontend API handling differs by module:
-   - General API client and Ollama manager may use different base URL strategies.
-   - Ensure `NEXT_PUBLIC_GATEWAY_URL` matches your deployment plan.
-
-4. Gateway file header mentions rate limiting, but active implementation is queue/state proxying and upload handling.
-
-5. Query provider support is `groq` and `ollama`; if provider backend is down, query returns an HTTP error (503 or propagated status).
-
----
-
-## 13) Troubleshooting
-
-### Upload stays `failed`
-
-- Check:
-  - `docker compose logs -f gateway ingestion-worker`
-- Common causes:
-  - unsupported MIME
-  - extraction failure with empty text where fallback is not applicable
-  - DB schema mismatch in old volumes
-
-### Embedding fails
-
-- Check:
-  - `docker compose logs -f embedding-worker`
-- Validate:
-  - `GEMINI_API_KEY`
-  - outbound internet to Gemini API
-
-### Query fails
-
-- Check:
-  - `docker compose logs -f query-service gateway`
-- Validate provider path:
-  - Groq key set for `groq`
-  - Ollama reachable for `ollama`
-
-### LAN clients cannot connect
-
-- Verify host IP and firewall rules.
-- Confirm same subnet and non-guest isolated Wi-Fi.
-- Test ports via `Test-NetConnection`.
-
 ---
 
 ## 14) File Guide
 
-- `docker-compose.yml`: service wiring, healthchecks, ports, envs.
-- `shared/init.sql`: base schema.
-- `gateway/main.py`: upload/status/query proxy/ollama proxy.
-- `ingestion-worker/main.py`: extraction, OCR/STT/vision, chunking, enqueue.
-- `embedding-worker/main.py`: embeddings, job tracking, vector upsert calls.
-- `vector-store/main.py`: Qdrant access and search cache.
-- `query-service/main.py`: RAG query orchestration.
-- `frontend/lib/api.ts`: main API client calls.
-- `frontend/components/Ollamamanager.tsx`: model management UI calls.
+- `docker-compose.yml` - full stack orchestration
+- `docker-compose.worker.yml` - remote ingestion/embedding workers
+- `.env.example` - complete env defaults/tuning
+- `shared/init.sql` - base schema
+- `gateway/main.py` - API ingress, scrape, metrics, queue producers
+- `ingestion-worker/main.py` - extraction/chunking + embedding queue producer
+- `embedding-worker/main.py` - background embeddings + query-time embeddings
+- `vector-store/main.py` - Qdrant access service
+- `query-service/main.py` - retrieval + LLM orchestration
+- `frontend/lib/api.ts` - frontend API client and error handling
+- `clear_database.py` - full runtime reset script
+- `clear_vector_db.py` - vector-only reset script
 
 ---
 
-## 15) Quick Verification Checklist
+## 15) Verification Checklist
 
-1. `docker compose ps` shows all services healthy.
-2. Upload text/pdf/image/audio/video from UI.
-3. Observe status transitions to `done`.
-4. Ask "when was X said" on audio/video and verify timestamped sources.
-5. Confirm visual description chunks appear for image/video.
-6. Connect a second device to `http://<docker-host-ip>:3000` and repeat query.
+1. `docker compose ps` shows healthy services.
+2. Upload text/pdf/image/audio/video and watch status reach `done`.
+3. Scrape a website in Scrape tab and verify new document appears.
+4. Query with Groq and Ollama models.
+5. Confirm Ollama model selector shows installed models only.
+6. Open app from a second device and confirm metrics show active devices.
+7. If remote workers enabled, confirm chunks/embeddings continue flowing and are queryable.
 

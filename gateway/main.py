@@ -9,13 +9,16 @@ Responsibilities:
   • Single entry point for all client traffic
 """
 
-import os, uuid, hashlib, mimetypes
+import os, uuid, hashlib, mimetypes, re
 from pathlib import Path
 from typing import Optional
+from collections import deque
+from urllib.parse import urljoin, urlparse, urldefrag
+from html.parser import HTMLParser
 import httpx, aiofiles
 import redis.asyncio as aioredis
 import asyncpg
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -39,12 +42,20 @@ POSTGRES_URL       = os.getenv("POSTGRES_URL")
 INGESTION_URL      = os.getenv("INGESTION_SERVICE_URL", "http://ingestion-worker:8001")
 QUERY_URL          = os.getenv("QUERY_SERVICE_URL", "http://query-service:8004")
 UPLOAD_DIR         = Path(os.getenv("UPLOAD_DIR", "/uploads"))
+DB_POOL_MIN        = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX        = int(os.getenv("DB_POOL_MAX", "10"))
+QUERY_TIMEOUT_SEC  = float(os.getenv("GATEWAY_QUERY_TIMEOUT_SEC", "120"))
+HTTP_RETRIES       = int(os.getenv("GATEWAY_HTTP_RETRIES", "1"))
+HEALTH_TIMEOUT_SEC = float(os.getenv("GATEWAY_HEALTH_TIMEOUT_SEC", "3"))
+SCRAPE_MAX_PAGES_DEFAULT = int(os.getenv("SCRAPE_MAX_PAGES_DEFAULT", "25"))
+SCRAPE_MAX_PAGES_HARD_LIMIT = int(os.getenv("SCRAPE_MAX_PAGES_HARD_LIMIT", "100"))
+MAX_FILE_SIZE      = int(os.getenv("MAX_FILE_SIZE_MB", "200")) * 1024 * 1024
 
 ALLOWED_MIME_PREFIXES = ("text/", "image/", "audio/", "video/", "application/pdf")
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
 
 redis_client: aioredis.Redis = None
 db_pool: asyncpg.Pool = None
+DEVICE_TTL_SEC = 120
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -52,9 +63,11 @@ db_pool: asyncpg.Pool = None
 @app.on_event("startup")
 async def startup():
     global redis_client, db_pool
+    if not POSTGRES_URL:
+        raise RuntimeError("POSTGRES_URL is required")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX)
     log.info("Gateway started ✓")
 
 
@@ -79,7 +92,7 @@ async def system_status():
         "query":     f"{QUERY_URL}/health",
     }
     results = {}
-    async with httpx.AsyncClient(timeout=3) as client:
+    async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT_SEC) as client:
         for name, url in services.items():
             try:
                 r = await client.get(url)
@@ -116,7 +129,7 @@ async def upload_document(file: UploadFile = File(...)):
             size += len(chunk)
             if size > MAX_FILE_SIZE:
                 dest.unlink(missing_ok=True)
-                raise HTTPException(413, "File too large (max 200 MB)")
+                raise HTTPException(413, f"File too large (max {MAX_FILE_SIZE // (1024 * 1024)} MB)")
             await f.write(chunk)
 
     # Determine type bucket
@@ -204,17 +217,156 @@ class QueryRequest(BaseModel):
     top_k: int = 5
 
 
+class WebsiteScrapeRequest(BaseModel):
+    url: str
+    max_pages: int = SCRAPE_MAX_PAGES_DEFAULT
+
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+        self.links = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t in ("script", "style", "noscript"):
+            self._skip_depth += 1
+        if t == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in ("script", "style", "noscript") and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            d = data.strip()
+            if d:
+                self.text_parts.append(d)
+
+    def get_text(self):
+        return " ".join(self.text_parts)
+
+
+def normalize_url(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if not s.startswith(("http://", "https://")):
+        s = "https://" + s
+    parsed = urlparse(s)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    clean = parsed._replace(fragment="")
+    return clean.geturl()
+
+
+def same_host(a: str, b: str) -> bool:
+    return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
+
+
+def clean_text(txt: str) -> str:
+    return re.sub(r"\s+", " ", txt or "").strip()
+
+
+async def scrape_site(seed_url: str, max_pages: int) -> tuple[str, int]:
+    visited = set()
+    q = deque([seed_url])
+    docs = []
+    pages = 0
+    max_pages = max(1, min(max_pages, SCRAPE_MAX_PAGES_HARD_LIMIT))
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        while q and pages < max_pages:
+            current = q.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
+            try:
+                r = await client.get(current, headers={"User-Agent": "DistributedRAGBot/1.0"})
+            except Exception:
+                continue
+            if r.status_code >= 400:
+                continue
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+                continue
+            parser = TextExtractor()
+            try:
+                parser.feed(r.text)
+            except Exception:
+                continue
+            text = clean_text(parser.get_text())
+            if not text:
+                continue
+            pages += 1
+            docs.append(f"URL: {current}\n\n{text}")
+            for href in parser.links:
+                nxt, _ = urldefrag(urljoin(current, href))
+                if not nxt.startswith(("http://", "https://")):
+                    continue
+                if same_host(seed_url, nxt) and nxt not in visited:
+                    q.append(nxt)
+    return "\n\n" + ("\n\n".join(docs)), pages
+
+
 @app.post("/api/query")
 async def query(req: QueryRequest):
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(f"{QUERY_URL}/api/query", json=req.dict())
-            r.raise_for_status()
-            return r.json()
-    except httpx.TimeoutException:
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=QUERY_TIMEOUT_SEC) as client:
+                r = await client.post(f"{QUERY_URL}/api/query", json=req.dict())
+                r.raise_for_status()
+                return r.json()
+        except httpx.TimeoutException as e:
+            last_exc = e
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(e.response.status_code, e.response.text)
+        except Exception as e:
+            last_exc = e
+    if isinstance(last_exc, httpx.TimeoutException):
         raise HTTPException(504, "Query service timed out")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(e.response.status_code, e.response.text)
+    raise HTTPException(503, f"Query service unavailable: {last_exc}")
+
+
+@app.post("/api/websites/scrape")
+async def scrape_website(req: WebsiteScrapeRequest):
+    base = normalize_url(req.url)
+    if not base:
+        raise HTTPException(400, "Invalid URL")
+    content, pages = await scrape_site(base, req.max_pages)
+    if pages == 0 or not content.strip():
+        raise HTTPException(400, "No scrapeable HTML content found")
+
+    doc_id = str(uuid.uuid4())
+    saved_name = f"{doc_id}.txt"
+    dest = UPLOAD_DIR / saved_name
+    payload = content.strip()
+    async with aiofiles.open(dest, "w", encoding="utf-8") as f:
+        await f.write(payload)
+    size = dest.stat().st_size
+
+    title = f"website_{urlparse(base).netloc}_{pages}pages.txt"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO documents (id, filename, original_name, file_type, file_size, status)
+               VALUES ($1,$2,$3,$4,$5,'queued')""",
+            doc_id, saved_name, title, "text", size
+        )
+
+    job = {
+        "doc_id": doc_id,
+        "filename": saved_name,
+        "file_type": "text",
+        "file_path": str(dest),
+    }
+    await redis_client.lpush("ingestion:queue", json.dumps(job))
+    return {"doc_id": doc_id, "status": "queued", "pages_scraped": pages, "source_url": base}
 
 
 @app.get("/api/query/history")
@@ -236,6 +388,61 @@ async def queue_stats():
     return {
         "ingestion_queue": ing_len,
         "embedding_queue": emb_len,
+    }
+
+
+@app.post("/api/client/heartbeat")
+async def client_heartbeat(body: dict, request: Request):
+    client_id = (body.get("client_id") or "").strip()
+    if not client_id:
+        raise HTTPException(400, "client_id is required")
+    now = int(time.time())
+    entry = {
+        "client_id": client_id,
+        "name": (body.get("name") or "").strip() or "Unknown device",
+        "ip": request.client.host if request.client else "",
+        "ua": request.headers.get("user-agent", ""),
+        "last_seen": now,
+    }
+    await redis_client.hset("clients:last_seen", client_id, str(now))
+    await redis_client.hset("clients:meta", client_id, json.dumps(entry))
+    return {"ok": True, "last_seen": now}
+
+
+@app.get("/api/stats/overview")
+async def stats_overview():
+    now = int(time.time())
+    raw_seen = await redis_client.hgetall("clients:last_seen")
+    active_ids = []
+    for client_id, seen in raw_seen.items():
+        try:
+            if now - int(seen) <= DEVICE_TTL_SEC:
+                active_ids.append(client_id)
+        except Exception:
+            continue
+    metas = await redis_client.hmget("clients:meta", active_ids) if active_ids else []
+    devices = []
+    for raw in metas or []:
+        if not raw:
+            continue
+        try:
+            devices.append(json.loads(raw))
+        except Exception:
+            continue
+    async with db_pool.acquire() as conn:
+        docs_total = await conn.fetchval("SELECT COUNT(*) FROM documents")
+        docs_ingested = await conn.fetchval("SELECT COUNT(*) FROM documents WHERE status='done'")
+        chunks_total = await conn.fetchval("SELECT COUNT(*) FROM chunks")
+        embeddings_done = await conn.fetchval("SELECT COUNT(*) FROM embedding_jobs WHERE status='done'")
+        embeddings_failed = await conn.fetchval("SELECT COUNT(*) FROM embedding_jobs WHERE status='failed'")
+    return {
+        "active_devices": len(devices),
+        "devices": devices,
+        "documents_total": docs_total,
+        "documents_ingested": docs_ingested,
+        "chunks_total": chunks_total,
+        "embeddings_done": embeddings_done,
+        "embeddings_failed": embeddings_failed,
     }
 
 

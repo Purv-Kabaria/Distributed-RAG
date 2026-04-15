@@ -25,13 +25,16 @@ export default function DocumentList({ refreshSignal }: { refreshSignal: number 
   const [docs, setDocs] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
       const data = await getDocuments();
       setDocs(data);
-    } catch (_) {
-      /* ignore */
+      setError(null);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to load documents";
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -49,8 +52,10 @@ export default function DocumentList({ refreshSignal }: { refreshSignal: number 
     try {
       await deleteDocument(id);
       setDocs((prev) => prev.filter((d) => d.id !== id));
-    } catch (_) {
-      /* ignore */
+      setError(null);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Failed to delete document";
+      setError(msg);
     } finally {
       setDeleting(null);
     }
@@ -71,6 +76,7 @@ export default function DocumentList({ refreshSignal }: { refreshSignal: number 
       <div className="text-center py-10 text-[var(--color-text-muted)]">
         <File size={32} className="mx-auto mb-2 opacity-30" />
         <p className="text-sm">No documents yet. Upload something above.</p>
+        {error && <p className="text-xs text-[var(--color-danger)] mt-2">{error}</p>}
       </div>
     );
   }
@@ -86,6 +92,11 @@ export default function DocumentList({ refreshSignal }: { refreshSignal: number 
           <RefreshCw size={13} />
         </button>
       </div>
+      {error && (
+        <div className="rounded-lg border border-red-900/40 bg-[#1e0808] px-3 py-2 text-xs text-[var(--color-danger)] mb-2">
+          {error}
+        </div>
+      )}
       {docs.map((doc) => (
         <div
           key={doc.id}

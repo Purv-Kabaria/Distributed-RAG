@@ -35,6 +35,8 @@ VECTOR_STORE_URL  = os.getenv("VECTOR_STORE_URL", "http://vector-store:8003")
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 UPLOAD_DIR        = Path(os.getenv("UPLOAD_DIR", "/uploads"))
 CONCURRENCY       = int(os.getenv("WORKER_CONCURRENCY", "2"))
+QUERY_EMBED_CONCURRENCY = int(os.getenv("QUERY_EMBED_CONCURRENCY", "8"))
+QUEUE_POP_TIMEOUT_SEC = int(os.getenv("EMBEDDING_QUEUE_POP_TIMEOUT_SEC", "2"))
 
 # Gemini Embedding 2 - first natively multimodal embedding model
 EMBEDDING_MODEL   = "gemini-embedding-2-preview"
@@ -43,16 +45,18 @@ EMBEDDING_DIM     = 3072   # default; can be reduced with MRL
 redis_client: aioredis.Redis = None
 db_pool: asyncpg.Pool = None
 gemini_client: genai.Client = None
+query_embed_semaphore: asyncio.Semaphore | None = None
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    global redis_client, db_pool, gemini_client
+    global redis_client, db_pool, gemini_client, query_embed_semaphore
     redis_client  = aioredis.from_url(REDIS_URL, decode_responses=False)
     db_pool       = await asyncpg.create_pool(POSTGRES_URL, min_size=2, max_size=10)
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    query_embed_semaphore = asyncio.Semaphore(max(1, QUERY_EMBED_CONCURRENCY))
     # Start N concurrent workers
     for i in range(CONCURRENCY):
         asyncio.create_task(worker_loop(worker_id=i))
@@ -75,7 +79,8 @@ async def embed_text_endpoint(body: dict):
     """Synchronous embed endpoint for the query service."""
     text = body.get("text", "")
     task = body.get("task_type", "RETRIEVAL_QUERY")
-    vec  = await embed_text(text, task_type=task)
+    async with query_embed_semaphore:
+        vec = await embed_text(text, task_type=task)
     return {"embedding": vec}
 
 
@@ -257,7 +262,7 @@ async def worker_loop(worker_id: int = 0):
     log.info(f"Embedding worker-{worker_id} listening on embedding:queue")
     while True:
         try:
-            item = await redis_client.brpop(b"embedding:queue", timeout=2)
+            item = await redis_client.brpop(b"embedding:queue", timeout=QUEUE_POP_TIMEOUT_SEC)
             if item:
                 _, raw = item
                 job = json.loads(raw.decode())

@@ -10,13 +10,12 @@ Responsibilities:
   • Log queries to Postgres
 """
 
-import os, logging, time, json
-from typing import Optional, AsyncGenerator
+import os, logging, time
+from typing import Optional
 import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [query] %(message)s")
@@ -25,17 +24,25 @@ log = logging.getLogger(__name__)
 app = FastAPI(title="Distributed RAG – Query Service", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-REDIS_URL          = os.getenv("REDIS_URL", "redis://localhost:6379")
 POSTGRES_URL       = os.getenv("POSTGRES_URL")
 VECTOR_STORE_URL   = os.getenv("VECTOR_STORE_URL", "http://vector-store:8003")
 EMBEDDING_URL      = os.getenv("EMBEDDING_SERVICE_URL", "http://embedding-worker:8002")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 OLLAMA_URL         = os.getenv("OLLAMA_URL", "")
+GROQ_DEFAULT_MODEL = os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile")
+OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma3:4b")
+QUESTION_MAX_CHARS = int(os.getenv("QUESTION_MAX_CHARS", "6000"))
+TOP_K_MIN = int(os.getenv("TOP_K_MIN", "1"))
+TOP_K_MAX = int(os.getenv("TOP_K_MAX", "20"))
+EMBED_TIMEOUT_SEC = float(os.getenv("EMBED_TIMEOUT_SEC", "30"))
+VECTOR_TIMEOUT_SEC = float(os.getenv("VECTOR_TIMEOUT_SEC", "20"))
+GROQ_TIMEOUT_SEC = float(os.getenv("GROQ_TIMEOUT_SEC", "60"))
+OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "120"))
+HTTP_RETRIES = int(os.getenv("QUERY_HTTP_RETRIES", "2"))
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 
 db_pool: asyncpg.Pool = None
-
-GROQ_DEFAULT_MODEL   = "llama-3.3-70b-versatile"
-OLLAMA_DEFAULT_MODEL = "gemma3:4b"
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -43,7 +50,9 @@ OLLAMA_DEFAULT_MODEL = "gemma3:4b"
 @app.on_event("startup")
 async def startup():
     global db_pool
-    db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=2, max_size=10)
+    if not POSTGRES_URL:
+        raise RuntimeError("POSTGRES_URL is required")
+    db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX)
     log.info("Query service started ✓")
 
 
@@ -100,22 +109,34 @@ async def list_models():
 # ── Embed helper ──────────────────────────────────────────────────────────────
 
 async def embed_query(question: str) -> list[float]:
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{EMBEDDING_URL}/api/embed/text", json={"text": question})
-        r.raise_for_status()
-        return r.json()["embedding"]
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=EMBED_TIMEOUT_SEC) as client:
+                r = await client.post(f"{EMBEDDING_URL}/api/embed/text", json={"text": question})
+                r.raise_for_status()
+                return r.json()["embedding"]
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 # ── Retrieve helper ───────────────────────────────────────────────────────────
 
 async def retrieve_context(vec: list[float], top_k: int) -> list[dict]:
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            f"{VECTOR_STORE_URL}/api/vectors/search",
-            json={"query_vector": vec, "top_k": top_k}
-        )
-        r.raise_for_status()
-        return r.json()["hits"]
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=VECTOR_TIMEOUT_SEC) as client:
+                r = await client.post(
+                    f"{VECTOR_STORE_URL}/api/vectors/search",
+                    json={"query_vector": vec, "top_k": top_k}
+                )
+                r.raise_for_status()
+                return r.json()["hits"]
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 # ── LLM Callers ───────────────────────────────────────────────────────────────
@@ -135,6 +156,7 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
         blocks.append(f"[Source {i + 1}{th} | score={c['score']:.3f}]\n{c['text']}")
     context = "\n\n---\n\n".join(blocks)
     return f"""You are a helpful assistant. Answer using ONLY the context below.
+Always respond in English only.
 For audio or video transcripts, lines look like [MM:SS.mm–MM:SS.mm] speech. Cite those timestamps (or the media_time range in seconds) when the user asks when something was said or shown.
 For image or video visual descriptions, use the described content as facts about what appears.
 
@@ -151,34 +173,46 @@ ANSWER:"""
 async def call_groq(prompt: str, model: str) -> str:
     if not GROQ_API_KEY:
         raise HTTPException(400, "GROQ_API_KEY not configured")
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": model or GROQ_DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 1024,
-            }
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_SEC) as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                             "Content-Type": "application/json"},
+                    json={
+                        "model": model or GROQ_DEFAULT_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                        "max_tokens": 1024,
+                    }
+                )
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 async def call_ollama(prompt: str, model: str) -> str:
     if not OLLAMA_URL:
         raise HTTPException(400, "OLLAMA_URL not configured")
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": model or OLLAMA_DEFAULT_MODEL,
-                  "prompt": prompt,
-                  "stream": False}
-        )
-        r.raise_for_status()
-        return r.json().get("response", "")
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
+                r = await client.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={"model": model or OLLAMA_DEFAULT_MODEL,
+                          "prompt": prompt,
+                          "stream": False}
+                )
+                r.raise_for_status()
+                return r.json().get("response", "")
+        except Exception as e:
+            last_exc = e
+    raise last_exc
 
 
 # ── Main Query Endpoint ───────────────────────────────────────────────────────
@@ -192,14 +226,19 @@ class QueryRequest(BaseModel):
 
 @app.post("/api/query")
 async def query(req: QueryRequest):
-    if not req.question.strip():
+    question = req.question.strip()
+    if not question:
         raise HTTPException(400, "Question cannot be empty")
+    if len(question) > QUESTION_MAX_CHARS:
+        raise HTTPException(400, f"Question too long (max {QUESTION_MAX_CHARS} chars)")
+    if req.top_k < TOP_K_MIN or req.top_k > TOP_K_MAX:
+        raise HTTPException(400, f"top_k must be between {TOP_K_MIN} and {TOP_K_MAX}")
 
     t0 = time.time()
 
     # 1. Embed the question
     try:
-        query_vec = await embed_query(req.question)
+        query_vec = await embed_query(question)
     except Exception as e:
         raise HTTPException(503, f"Embedding service error: {e}")
 
@@ -211,7 +250,7 @@ async def query(req: QueryRequest):
 
     if not chunks:
         return {
-            "question": req.question,
+            "question": question,
             "answer":   "No relevant documents found. Please upload some documents first.",
             "chunks":   [],
             "model":    None,
@@ -220,7 +259,7 @@ async def query(req: QueryRequest):
         }
 
     # 3. Build prompt & call LLM
-    prompt = build_prompt(req.question, chunks)
+    prompt = build_prompt(question, chunks)
     model  = req.model
 
     try:
@@ -245,13 +284,13 @@ async def query(req: QueryRequest):
             await conn.execute(
                 """INSERT INTO query_logs (question,answer,model_used,provider,chunks_used,duration_ms)
                    VALUES ($1,$2,$3,$4,$5,$6)""",
-                req.question, answer, used_model, req.provider, len(chunks), duration_ms
+                question, answer, used_model, req.provider, len(chunks), duration_ms
             )
     except Exception as e:
         log.warning(f"Failed to log query: {e}")
 
     return {
-        "question":    req.question,
+        "question":    question,
         "answer":      answer,
         "chunks":      chunks,
         "model":       used_model,

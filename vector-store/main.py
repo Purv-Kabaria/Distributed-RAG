@@ -12,15 +12,14 @@ This service is the only component that speaks to Qdrant,
 enforcing the Decoupled Data principle.
 """
 
-import os, logging, hashlib, json, time
+import os, logging, hashlib, json
 from typing import Optional
 import redis.asyncio as aioredis
 import asyncpg
-import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter,
-    FieldCondition, MatchValue, SearchRequest
+    FieldCondition, MatchValue
 )
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,9 +35,13 @@ QDRANT_URL   = os.getenv("QDRANT_URL", "http://qdrant:6333")
 POSTGRES_URL = os.getenv("POSTGRES_URL")
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-COLLECTION   = "rag_chunks"
-VECTOR_DIM   = 3072   # Gemini Embedding 2 default
-CACHE_TTL    = 60     # seconds
+COLLECTION   = os.getenv("QDRANT_COLLECTION", "rag_chunks")
+VECTOR_DIM   = int(os.getenv("VECTOR_DIM", "3072"))
+CACHE_TTL    = int(os.getenv("VECTOR_CACHE_TTL_SEC", "60"))
+SEARCH_TOP_K_MIN = int(os.getenv("SEARCH_TOP_K_MIN", "1"))
+SEARCH_TOP_K_MAX = int(os.getenv("SEARCH_TOP_K_MAX", "50"))
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 
 qdrant: AsyncQdrantClient = None
 redis_client: aioredis.Redis = None
@@ -50,9 +53,11 @@ db_pool: asyncpg.Pool = None
 @app.on_event("startup")
 async def startup():
     global qdrant, redis_client, db_pool
+    if not POSTGRES_URL:
+        raise RuntimeError("POSTGRES_URL is required")
     qdrant       = AsyncQdrantClient(url=QDRANT_URL)
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-    db_pool      = await asyncpg.create_pool(POSTGRES_URL, min_size=2, max_size=10)
+    db_pool      = await asyncpg.create_pool(POSTGRES_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX)
     await ensure_collection()
     log.info("Vector Store started ✓")
 
@@ -110,8 +115,8 @@ class UpsertRequest(BaseModel):
 
 @app.post("/api/vectors/upsert")
 async def upsert_vector(req: UpsertRequest):
-    # Use chunk_id as deterministic integer ID (hash → int)
-    point_id = abs(hash(req.chunk_id)) % (2**63)
+    digest = hashlib.sha256(req.chunk_id.encode()).hexdigest()[:16]
+    point_id = int(digest, 16) % (2**63)
     point = PointStruct(
         id=point_id,
         vector=req.embedding,
@@ -137,9 +142,11 @@ class SearchRequest(BaseModel):
 
 @app.post("/api/vectors/search")
 async def search_vectors(req: SearchRequest):
-    # Cache key from vector fingerprint
-    fp  = hashlib.md5(str(req.query_vector[:8]).encode()).hexdigest()
-    key = f"vec:search:{fp}:{req.top_k}"
+    if req.top_k < SEARCH_TOP_K_MIN or req.top_k > SEARCH_TOP_K_MAX:
+        raise HTTPException(400, f"top_k must be between {SEARCH_TOP_K_MIN} and {SEARCH_TOP_K_MAX}")
+    vf = hashlib.md5(str(req.query_vector[:16]).encode()).hexdigest()
+    df = hashlib.md5(json.dumps(sorted(req.doc_filter or [])).encode()).hexdigest()
+    key = f"vec:search:{vf}:{req.top_k}:{df}"
     cached = await redis_client.get(key)
     if cached:
         return json.loads(cached)
