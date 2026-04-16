@@ -10,7 +10,7 @@ Responsibilities:
   • Log queries to Postgres
 """
 
-import os, logging, time
+import os, logging, time, re
 from typing import Optional
 import asyncpg
 import httpx
@@ -34,6 +34,8 @@ OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma3:4b")
 QUESTION_MAX_CHARS = int(os.getenv("QUESTION_MAX_CHARS", "6000"))
 TOP_K_MIN = int(os.getenv("TOP_K_MIN", "1"))
 TOP_K_MAX = int(os.getenv("TOP_K_MAX", "20"))
+LANG_ENFORCE_RETRY = int(os.getenv("LANG_ENFORCE_RETRY", "1"))
+LANG_ENFORCE_ANSWER_MAX_CHARS = int(os.getenv("LANG_ENFORCE_ANSWER_MAX_CHARS", "4000"))
 EMBED_TIMEOUT_SEC = float(os.getenv("EMBED_TIMEOUT_SEC", "30"))
 VECTOR_TIMEOUT_SEC = float(os.getenv("VECTOR_TIMEOUT_SEC", "20"))
 GROQ_TIMEOUT_SEC = float(os.getenv("GROQ_TIMEOUT_SEC", "60"))
@@ -156,7 +158,11 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
         blocks.append(f"[Source {i + 1}{th} | score={c['score']:.3f}]\n{c['text']}")
     context = "\n\n---\n\n".join(blocks)
     return f"""You are a helpful assistant. Answer using ONLY the context below.
-Always respond in English only.
+
+Answer in English only.
+If any part of the provided context or the question is not English, translate it to English and respond in English.
+Do not output any non-English text. Do not include words or sentences in other languages.
+If you cannot produce an English answer using ONLY the provided context, say: "I don't know based on the provided context." (in English).
 For audio or video transcripts, lines look like [MM:SS.mm–MM:SS.mm] speech. Cite those timestamps (or the media_time range in seconds) when the user asks when something was said or shown.
 For image or video visual descriptions, use the described content as facts about what appears.
 
@@ -170,6 +176,12 @@ QUESTION: {question}
 ANSWER:"""
 
 
+def likely_non_english(text: str) -> bool:
+    # Conservative detection for common non-Latin scripts.
+    s = text or ""
+    return bool(re.search(r"[\u0400-\u04FF\u0370-\u03FF\u4E00-\u9FFF\u0600-\u06FF\u0900-\u097F\u0B80-\u0BFF]", s))
+
+
 async def call_groq(prompt: str, model: str) -> str:
     if not GROQ_API_KEY:
         raise HTTPException(400, "GROQ_API_KEY not configured")
@@ -177,13 +189,20 @@ async def call_groq(prompt: str, model: str) -> str:
     for _ in range(HTTP_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_SEC) as client:
+                system_msg = (
+                    "You must respond in English only. If the provided context or question contains any other language, translate it to English before answering. "
+                    "Output only English text and nothing else."
+                )
                 r = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                              "Content-Type": "application/json"},
                     json={
                         "model": model or GROQ_DEFAULT_MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": [
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": prompt},
+                        ],
                         "temperature": 0.2,
                         "max_tokens": 1024,
                     }
@@ -199,13 +218,18 @@ async def call_ollama(prompt: str, model: str) -> str:
     if not OLLAMA_URL:
         raise HTTPException(400, "OLLAMA_URL not configured")
     last_exc = None
+    enforced_prompt = (
+        "You must respond in English only. If the provided context or question contains any other language, translate it to English. "
+        "Output only English text and nothing else.\n\n"
+        + prompt
+    )
     for _ in range(HTTP_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SEC) as client:
                 r = await client.post(
                     f"{OLLAMA_URL}/api/generate",
                     json={"model": model or OLLAMA_DEFAULT_MODEL,
-                          "prompt": prompt,
+                          "prompt": enforced_prompt,
                           "stream": False}
                 )
                 r.raise_for_status()
@@ -275,6 +299,20 @@ async def query(req: QueryRequest):
         raise
     except Exception as e:
         raise HTTPException(503, f"LLM error ({req.provider}): {e}")
+
+    if LANG_ENFORCE_RETRY > 0 and likely_non_english(answer):
+        try:
+            retry_prompt = (
+                prompt
+                + "\n\nPrevious output may include other languages. Translate it to English only. "
+                + f"Output only English text.\n\nPrevious output:\n{answer[:LANG_ENFORCE_ANSWER_MAX_CHARS]}"
+            )
+            if req.provider == "groq":
+                answer = await call_groq(retry_prompt, model or GROQ_DEFAULT_MODEL)
+            elif req.provider == "ollama":
+                answer = await call_ollama(retry_prompt, model or OLLAMA_DEFAULT_MODEL)
+        except Exception:
+            pass
 
     duration_ms = round((time.time() - t0) * 1000)
 
