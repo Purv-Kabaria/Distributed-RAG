@@ -387,7 +387,7 @@ async def video_visual_chunks(file_path: Path) -> list[tuple[str, float, float]]
                 "2",
                 str(tmp_path),
             ]
-            r = subprocess.run(cmd, capture_output=True, stderr=subprocess.DEVNULL)
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if r.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
                 continue
             cap = await vision_caption(
