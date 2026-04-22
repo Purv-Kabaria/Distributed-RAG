@@ -21,6 +21,11 @@ function timeAgo(iso: string) {
   return new Date(iso).toLocaleDateString();
 }
 
+function clampProgress(v: number) {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(100, v));
+}
+
 export default function DocumentList({ refreshSignal }: { refreshSignal: number }) {
   const [docs, setDocs] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
@@ -100,25 +105,53 @@ export default function DocumentList({ refreshSignal }: { refreshSignal: number 
       {docs.map((doc) => (
         <div
           key={doc.id}
-          className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] hover:border-[var(--color-brand)]/30 transition-colors group"
+          className="px-3 py-2.5 rounded-lg bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] hover:border-[var(--color-brand)]/30 transition-colors group"
         >
-          <span className="text-[var(--color-text-muted)] shrink-0">
-            {TYPE_ICON[doc.file_type] ?? <File size={14} />}
-          </span>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-medium text-[var(--color-text-primary)] truncate">{doc.original_name}</p>
-            <p className="text-xs text-[var(--color-text-muted)]">
-              {doc.chunk_count} chunk{doc.chunk_count !== 1 ? "s" : ""} &nbsp;·&nbsp; {timeAgo(doc.created_at)}
-            </p>
+          <div className="flex items-center gap-3">
+            <span className="text-[var(--color-text-muted)] shrink-0">
+              {TYPE_ICON[doc.file_type] ?? <File size={14} />}
+            </span>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-[var(--color-text-primary)] truncate">{doc.original_name}</p>
+              <p className="text-xs text-[var(--color-text-muted)]">
+                {(doc.chunks_indexed ?? doc.chunk_count)} chunk{(doc.chunks_indexed ?? doc.chunk_count) !== 1 ? "s" : ""} &nbsp;·&nbsp; {timeAgo(doc.created_at)}
+              </p>
+            </div>
+            <StatusBadge status={doc.status} />
+            <button
+              onClick={() => handleDelete(doc.id)}
+              disabled={deleting === doc.id}
+              className="opacity-0 group-hover:opacity-100 text-[var(--color-text-muted)] hover:text-[var(--color-danger)] transition-all disabled:opacity-30"
+            >
+              <Trash2 size={13} />
+            </button>
           </div>
-          <StatusBadge status={doc.status} />
-          <button
-            onClick={() => handleDelete(doc.id)}
-            disabled={deleting === doc.id}
-            className="opacity-0 group-hover:opacity-100 text-[var(--color-text-muted)] hover:text-[var(--color-danger)] transition-all disabled:opacity-30"
-          >
-            <Trash2 size={13} />
-          </button>
+          {(() => {
+            const chunksIndexed = doc.chunks_indexed ?? doc.chunk_count ?? 0;
+            const embDone = doc.embedding_done ?? 0;
+            const embTotal = doc.embedding_total ?? 0;
+            const embFailed = doc.embedding_failed ?? 0;
+            const progress = clampProgress(doc.indexing_progress_pct ?? (embTotal > 0 ? (embDone / embTotal) * 100 : doc.status === "done" ? 100 : 0));
+            const showProgress = ["chunking", "embedding", "done", "failed"].includes(doc.status) || chunksIndexed > 0 || embTotal > 0;
+            if (!showProgress) return null;
+            return (
+              <div className="mt-2 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px] text-[var(--color-text-muted)]">
+                  <span>Chunked: {chunksIndexed}</span>
+                  <span>
+                    Indexed: {embDone}/{embTotal}
+                    {embFailed > 0 ? ` (failed ${embFailed})` : ""}
+                  </span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-[var(--color-bg-surface)] overflow-hidden">
+                  <div
+                    className="h-full bg-[var(--color-brand)] transition-all"
+                    style={{ width: `${progress}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })()}
         </div>
       ))}
     </div>

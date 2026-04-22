@@ -171,7 +171,45 @@ async def upload_document(file: UploadFile = File(...)):
 async def doc_status(doc_id: str):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id,original_name,file_type,status,error_msg,chunk_count,created_at FROM documents WHERE id=$1",
+            """
+            SELECT
+                d.id,
+                d.original_name,
+                d.file_type,
+                d.status,
+                d.error_msg,
+                d.chunk_count,
+                d.created_at,
+                COALESCE(c.chunks_indexed, 0) AS chunks_indexed,
+                COALESCE(e.embedding_total, 0) AS embedding_total,
+                COALESCE(e.embedding_done, 0) AS embedding_done,
+                COALESCE(e.embedding_failed, 0) AS embedding_failed,
+                CASE
+                    WHEN COALESCE(e.embedding_total, 0) > 0
+                        THEN ROUND((COALESCE(e.embedding_done, 0)::numeric / e.embedding_total::numeric) * 100, 2)
+                    WHEN d.status = 'done'
+                        THEN 100::numeric
+                    ELSE 0::numeric
+                END AS indexing_progress_pct
+            FROM documents d
+            LEFT JOIN (
+                SELECT document_id, COUNT(*)::int AS chunks_indexed
+                FROM chunks
+                WHERE document_id = $1
+                GROUP BY document_id
+            ) c ON c.document_id = d.id
+            LEFT JOIN (
+                SELECT
+                    document_id,
+                    COUNT(*)::int AS embedding_total,
+                    COUNT(*) FILTER (WHERE status = 'done')::int AS embedding_done,
+                    COUNT(*) FILTER (WHERE status = 'failed')::int AS embedding_failed
+                FROM embedding_jobs
+                WHERE document_id = $1
+                GROUP BY document_id
+            ) e ON e.document_id = d.id
+            WHERE d.id = $1
+            """,
             doc_id
         )
     if not row:
@@ -183,7 +221,43 @@ async def doc_status(doc_id: str):
 async def list_documents(limit: int = Query(50, le=200)):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id,original_name,file_type,status,chunk_count,created_at FROM documents ORDER BY created_at DESC LIMIT $1",
+            """
+            SELECT
+                d.id,
+                d.original_name,
+                d.file_type,
+                d.status,
+                d.chunk_count,
+                d.created_at,
+                COALESCE(c.chunks_indexed, 0) AS chunks_indexed,
+                COALESCE(e.embedding_total, 0) AS embedding_total,
+                COALESCE(e.embedding_done, 0) AS embedding_done,
+                COALESCE(e.embedding_failed, 0) AS embedding_failed,
+                CASE
+                    WHEN COALESCE(e.embedding_total, 0) > 0
+                        THEN ROUND((COALESCE(e.embedding_done, 0)::numeric / e.embedding_total::numeric) * 100, 2)
+                    WHEN d.status = 'done'
+                        THEN 100::numeric
+                    ELSE 0::numeric
+                END AS indexing_progress_pct
+            FROM documents d
+            LEFT JOIN (
+                SELECT document_id, COUNT(*)::int AS chunks_indexed
+                FROM chunks
+                GROUP BY document_id
+            ) c ON c.document_id = d.id
+            LEFT JOIN (
+                SELECT
+                    document_id,
+                    COUNT(*)::int AS embedding_total,
+                    COUNT(*) FILTER (WHERE status = 'done')::int AS embedding_done,
+                    COUNT(*) FILTER (WHERE status = 'failed')::int AS embedding_failed
+                FROM embedding_jobs
+                GROUP BY document_id
+            ) e ON e.document_id = d.id
+            ORDER BY d.created_at DESC
+            LIMIT $1
+            """,
             limit
         )
     return [dict(r) for r in rows]

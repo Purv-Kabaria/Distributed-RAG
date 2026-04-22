@@ -27,6 +27,11 @@ export interface Document {
   file_type: string;
   status: string;
   chunk_count: number;
+  chunks_indexed?: number;
+  embedding_total?: number;
+  embedding_done?: number;
+  embedding_failed?: number;
+  indexing_progress_pct?: number;
   error_msg?: string;
   created_at: string;
 }

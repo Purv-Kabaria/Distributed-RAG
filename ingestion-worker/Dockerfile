@@ -7,6 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ffmpeg tes
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+ARG WHISPER_MODEL_SIZE=small
+ENV WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE}
+ENV WHISPER_DOWNLOAD_ROOT=/models/whisper
+ENV WHISPER_LOCAL_ONLY=1
+
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${WHISPER_MODEL_SIZE}', device='cpu', compute_type='int8', download_root='/models/whisper', local_files_only=False)"
+
 COPY . .
 
 EXPOSE 8001

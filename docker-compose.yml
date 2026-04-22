@@ -97,6 +97,8 @@ services:
     build:
       context: ./ingestion-worker
       dockerfile: Dockerfile
+      args:
+        - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
     restart: unless-stopped
     networks: [rag-net]
     volumes:
@@ -111,6 +113,8 @@ services:
       - VIDEO_VISUAL_MAX_FRAMES=${VIDEO_VISUAL_MAX_FRAMES:-6}
       - VIDEO_VISUAL_INTERVAL_SEC=${VIDEO_VISUAL_INTERVAL_SEC:-45}
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
+      - WHISPER_DOWNLOAD_ROOT=${WHISPER_DOWNLOAD_ROOT:-/models/whisper}
+      - WHISPER_LOCAL_ONLY=${WHISPER_LOCAL_ONLY:-1}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-2.0-flash}
       - VISION_ORDER=${VISION_ORDER:-ollama_then_gemini}

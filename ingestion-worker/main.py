@@ -22,6 +22,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 POSTGRES_URL = os.getenv("POSTGRES_URL")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/uploads"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
+WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "")
+WHISPER_DOWNLOAD_ROOT = os.getenv("WHISPER_DOWNLOAD_ROOT", "/models/whisper")
+WHISPER_LOCAL_ONLY = os.getenv("WHISPER_LOCAL_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
 OLLAMA_URL = (os.getenv("OLLAMA_URL") or "").rstrip("/")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
@@ -241,7 +244,14 @@ async def get_whisper_model():
     loop = asyncio.get_event_loop()
 
     def _load():
-        return WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        target = WHISPER_MODEL_PATH.strip() or WHISPER_MODEL_SIZE
+        return WhisperModel(
+            target,
+            device="cpu",
+            compute_type="int8",
+            download_root=WHISPER_DOWNLOAD_ROOT,
+            local_files_only=WHISPER_LOCAL_ONLY,
+        )
 
     whisper_model = await loop.run_in_executor(None, _load)
     return whisper_model

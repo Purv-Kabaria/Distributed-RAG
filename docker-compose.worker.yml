@@ -9,6 +9,8 @@ services:
     build:
       context: ./ingestion-worker
       dockerfile: Dockerfile
+      args:
+        - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
     restart: unless-stopped
     volumes:
       - ${SHARED_UPLOADS_DIR:-./uploads-worker}:/uploads
@@ -21,6 +23,8 @@ services:
       - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL:-http://embedding-worker:8002}
       - UPLOAD_DIR=/uploads
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
+      - WHISPER_DOWNLOAD_ROOT=${WHISPER_DOWNLOAD_ROOT:-/models/whisper}
+      - WHISPER_LOCAL_ONLY=${WHISPER_LOCAL_ONLY:-1}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OLLAMA_URL=${OLLAMA_URL:-}
       - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
