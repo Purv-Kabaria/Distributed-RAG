@@ -10,7 +10,7 @@ Responsibilities:
   • Log queries to Postgres
 """
 
-import os, logging, time, re
+import os, logging, time, re, math
 from typing import Optional
 import asyncpg
 import httpx
@@ -43,6 +43,18 @@ OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "120"))
 HTTP_RETRIES = int(os.getenv("QUERY_HTTP_RETRIES", "2"))
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+RETRIEVAL_CANDIDATE_MULTIPLIER = int(os.getenv("RETRIEVAL_CANDIDATE_MULTIPLIER", "4"))
+RETRIEVAL_CANDIDATE_MAX = int(os.getenv("RETRIEVAL_CANDIDATE_MAX", "60"))
+RERANK_SEMANTIC_WEIGHT = float(os.getenv("RERANK_SEMANTIC_WEIGHT", "0.72"))
+RERANK_LEXICAL_WEIGHT = float(os.getenv("RERANK_LEXICAL_WEIGHT", "0.28"))
+RERANK_RECENCY_WEIGHT = float(os.getenv("RERANK_RECENCY_WEIGHT", "0.04"))
+CONTEXT_CHARS_PER_CHUNK = int(os.getenv("CONTEXT_CHARS_PER_CHUNK", "2200"))
+MIN_TOP_SCORE_TO_ANSWER = float(os.getenv("MIN_TOP_SCORE_TO_ANSWER", "0.22"))
+MIN_AVG_SCORE_TO_ANSWER = float(os.getenv("MIN_AVG_SCORE_TO_ANSWER", "0.16"))
+MIN_POST_ANSWER_GROUNDING = float(os.getenv("MIN_POST_ANSWER_GROUNDING", "0.08"))
+MULTI_QUERY_ENABLED = int(os.getenv("MULTI_QUERY_ENABLED", "1"))
+MULTI_QUERY_MAX = int(os.getenv("MULTI_QUERY_MAX", "4"))
+RRF_K = int(os.getenv("RRF_K", "60"))
 
 db_pool: asyncpg.Pool = None
 
@@ -141,6 +153,163 @@ async def retrieve_context(vec: list[float], top_k: int) -> list[dict]:
     raise last_exc
 
 
+def build_search_queries(question: str) -> list[str]:
+    q = question.strip()
+    if not q:
+        return []
+    variants = [q]
+    lower = normalize_text(q)
+    temporal = re.sub(
+        r"\b(when|time|timestamp|what\s+time|at\s+what\s+time|earlier|later|before|after|first|last)\b",
+        "",
+        lower,
+    )
+    temporal = re.sub(r"\s+", " ", temporal).strip(" ?.")
+    if temporal and temporal != lower:
+        variants.append(temporal)
+    focus = re.sub(
+        r"\b(please|could you|can you|tell me|explain|summarize|describe)\b",
+        "",
+        lower,
+    )
+    focus = re.sub(r"\s+", " ", focus).strip(" ?.")
+    if focus and focus != lower and focus not in variants:
+        variants.append(focus)
+    if quote_required(q):
+        variants.append(lower.replace("exact quote", "").replace("verbatim", "").strip())
+    out = []
+    seen = set()
+    for v in variants:
+        if v and v not in seen:
+            out.append(v)
+            seen.add(v)
+    return out[:max(1, MULTI_QUERY_MAX)]
+
+
+def rrf_fuse(rank_lists: list[list[dict]], k: int = 60) -> list[dict]:
+    scored: dict[str, dict] = {}
+    for lst in rank_lists:
+        for rank, item in enumerate(lst, start=1):
+            cid = str(item.get("chunk_id") or f"row-{rank}")
+            s = 1.0 / (k + rank)
+            if cid not in scored:
+                scored[cid] = {
+                    "rrf": 0.0,
+                    "best_score": float(item.get("score") or 0.0),
+                    "item": item,
+                }
+            scored[cid]["rrf"] += s
+            if float(item.get("score") or 0.0) > scored[cid]["best_score"]:
+                scored[cid]["best_score"] = float(item.get("score") or 0.0)
+                scored[cid]["item"] = item
+    fused = []
+    for rec in scored.values():
+        it = dict(rec["item"])
+        it["score"] = max(float(it.get("score") or 0.0), rec["best_score"])
+        it["_rrf_score"] = rec["rrf"]
+        fused.append(it)
+    fused.sort(key=lambda x: (float(x.get("_rrf_score", 0.0)), float(x.get("score", 0.0))), reverse=True)
+    return fused
+
+
+async def retrieve_context_multi_query(question: str, top_k: int, candidate_k: int) -> list[dict]:
+    queries = build_search_queries(question) if MULTI_QUERY_ENABLED else [question]
+    if not queries:
+        return []
+    rank_lists: list[list[dict]] = []
+    for q in queries:
+        vec = await embed_query(q)
+        hits = await retrieve_context(vec, candidate_k)
+        rank_lists.append(hits[:candidate_k])
+    return rrf_fuse(rank_lists, k=RRF_K)
+
+
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def tokenize(s: str) -> set[str]:
+    text = normalize_text(s)
+    words = re.findall(r"[a-z0-9']+", text)
+    return {w for w in words if len(w) > 1}
+
+
+def lexical_overlap(question: str, chunk_text: str) -> float:
+    q = tokenize(question)
+    c = tokenize(chunk_text)
+    if not q or not c:
+        return 0.0
+    inter = len(q & c)
+    if inter == 0:
+        return 0.0
+    return inter / max(1, len(q))
+
+
+def answer_grounding_overlap(answer: str, chunks: list[dict]) -> float:
+    a = tokenize(answer)
+    if not a:
+        return 0.0
+    union = set()
+    for c in chunks:
+        union |= tokenize(c.get("text", ""))
+    if not union:
+        return 0.0
+    return len(a & union) / max(1, len(a))
+
+
+def temporal_question(question: str) -> bool:
+    q = normalize_text(question)
+    patterns = [
+        "when ", "what time", "timestamp", "timecode", "at what point",
+        "earlier", "later", "before", "after", "first", "last",
+    ]
+    return any(p in q for p in patterns)
+
+
+def quote_required(question: str) -> bool:
+    q = normalize_text(question)
+    patterns = [
+        "exact words", "exact quote", "verbatim", "word for word", "quote exactly",
+    ]
+    return any(p in q for p in patterns)
+
+
+def rerank_chunks(question: str, chunks: list[dict], top_k: int) -> list[dict]:
+    if not chunks:
+        return []
+    wants_temporal = temporal_question(question)
+    scored = []
+    for idx, c in enumerate(chunks):
+        sem = float(c.get("score") or 0.0)
+        lex = lexical_overlap(question, c.get("text", ""))
+        kind = str(c.get("chunk_kind") or "")
+        temporal_bonus = 0.0
+        if wants_temporal and kind in ("transcript", "visual_frame"):
+            temporal_bonus += 0.08
+        if wants_temporal and c.get("time_start_sec") is not None:
+            temporal_bonus += 0.04
+        recency = 1.0 / (1.0 + math.log1p(idx + 1))
+        total = (
+            RERANK_SEMANTIC_WEIGHT * sem
+            + RERANK_LEXICAL_WEIGHT * lex
+            + RERANK_RECENCY_WEIGHT * recency
+            + temporal_bonus
+        )
+        scored.append((total, idx, c))
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    out = [row[2] for row in scored[:max(1, top_k)]]
+    return out
+
+
+def retrieval_confident_enough(chunks: list[dict]) -> bool:
+    if not chunks:
+        return False
+    scores = [float(c.get("score") or 0.0) for c in chunks]
+    top = max(scores)
+    avg = sum(scores) / len(scores)
+    return top >= MIN_TOP_SCORE_TO_ANSWER and avg >= MIN_AVG_SCORE_TO_ANSWER
+
+
 # ── LLM Callers ───────────────────────────────────────────────────────────────
 
 def _time_hint(c: dict) -> str:
@@ -152,28 +321,48 @@ def _time_hint(c: dict) -> str:
 
 
 def build_prompt(question: str, chunks: list[dict]) -> str:
+    prefers_exact_quote = quote_required(question)
     blocks = []
     for i, c in enumerate(chunks):
         th = _time_hint(c)
-        blocks.append(f"[Source {i + 1}{th} | score={c['score']:.3f}]\n{c['text']}")
+        kind = c.get("chunk_kind") or "generic"
+        file_type = c.get("file_type") or "unknown"
+        content = (c.get("text") or "")[:CONTEXT_CHARS_PER_CHUNK]
+        blocks.append(f"[Source {i + 1}{th} | score={c['score']:.3f} | kind={kind} | type={file_type}]\n{content}")
     context = "\n\n---\n\n".join(blocks)
-    return f"""You are a helpful assistant. Answer using ONLY the context below.
+    quote_rule = (
+        "If the user explicitly asks for an exact quote or verbatim text, provide exact wording from context."
+        if prefers_exact_quote
+        else "For audio/video transcript content, do not merely quote raw lines; prefer concise paraphrased explanations in your own words while preserving meaning."
+    )
+    return f"""[SYSTEM]
+You are a precision RAG assistant. Use ONLY the provided CONTEXT.
 
 Answer in English only.
 If any part of the provided context or the question is not English, translate it to English and respond in English.
 Do not output any non-English text. Do not include words or sentences in other languages.
 If you cannot produce an English answer using ONLY the provided context, say: "I don't know based on the provided context." (in English).
-For audio or video transcripts, lines look like [MM:SS.mm–MM:SS.mm] speech. Cite those timestamps (or the media_time range in seconds) when the user asks when something was said or shown.
-For image or video visual descriptions, use the described content as facts about what appears.
+For audio or video transcripts, lines look like [MM:SS.mm–MM:SS.mm] speech. When the user asks when something was said or shown, include timestamps (or media_time ranges in seconds).
+For image or video visual descriptions, use the described content as factual evidence.
+{quote_rule}
+Use multi-source reasoning: compare relevant sources, reconcile contradictions, and prefer the highest-scoring evidence.
+Never use outside knowledge. Never invent missing details.
+When uncertain, state uncertainty explicitly instead of hallucinating.
+For tricky questions requiring synthesis across multiple chunks, give a short direct answer first, then a brief evidence-based explanation.
+After each major claim, cite evidence as [Source N].
+If evidence is insufficient or conflicting, answer exactly: "I don't know based on the provided context."
 
-If the context does not contain enough information, say so clearly.
+[USER QUESTION]
+{question}
 
-CONTEXT:
+[CONTEXT]
 {context}
 
-QUESTION: {question}
-
-ANSWER:"""
+[RESPONSE FORMAT]
+1) Direct answer (2-5 sentences max)
+2) Evidence bullets with citations [Source N]
+3) If asked for time in audio/video, include timestamp(s)
+"""
 
 
 def likely_non_english(text: str) -> bool:
@@ -260,17 +449,13 @@ async def query(req: QueryRequest):
 
     t0 = time.time()
 
-    # 1. Embed the question
+    # 1. Retrieve (multi-query + fusion) and rerank context
     try:
-        query_vec = await embed_query(question)
+        candidate_k = min(RETRIEVAL_CANDIDATE_MAX, max(req.top_k, req.top_k * RETRIEVAL_CANDIDATE_MULTIPLIER))
+        retrieved = await retrieve_context_multi_query(question, req.top_k, candidate_k)
+        chunks = rerank_chunks(question, retrieved, req.top_k)
     except Exception as e:
-        raise HTTPException(503, f"Embedding service error: {e}")
-
-    # 2. Retrieve context
-    try:
-        chunks = await retrieve_context(query_vec, req.top_k)
-    except Exception as e:
-        raise HTTPException(503, f"Vector store error: {e}")
+        raise HTTPException(503, f"Retrieval pipeline error: {e}")
 
     if not chunks:
         return {
@@ -280,6 +465,17 @@ async def query(req: QueryRequest):
             "model":    None,
             "provider": req.provider,
             "duration_ms": round((time.time() - t0) * 1000),
+        }
+
+    if not retrieval_confident_enough(chunks):
+        duration_ms = round((time.time() - t0) * 1000)
+        return {
+            "question": question,
+            "answer": "I don't know based on the provided context.",
+            "chunks": chunks,
+            "model": None,
+            "provider": req.provider,
+            "duration_ms": duration_ms,
         }
 
     # 3. Build prompt & call LLM
@@ -313,6 +509,16 @@ async def query(req: QueryRequest):
                 answer = await call_ollama(retry_prompt, model or OLLAMA_DEFAULT_MODEL)
         except Exception:
             pass
+
+    if likely_non_english(answer):
+        raise HTTPException(
+            502,
+            "Language enforcement failed: model returned non-English output after retry.",
+        )
+
+    grounding = answer_grounding_overlap(answer, chunks)
+    if grounding < MIN_POST_ANSWER_GROUNDING:
+        answer = "I don't know based on the provided context."
 
     duration_ms = round((time.time() - t0) * 1000)
 
