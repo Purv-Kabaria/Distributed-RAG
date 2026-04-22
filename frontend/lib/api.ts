@@ -190,11 +190,12 @@ export async function queryRAG(
   question: string,
   provider: string,
   model: string,
-  top_k = 5
+  top_k = 5,
+  gemini_api_key?: string
 ): Promise<QueryResult> {
   return req<QueryResult>("/api/query", {
     method: "POST",
-    body: JSON.stringify({ question, provider, model, top_k }),
+    body: JSON.stringify({ question, provider, model, top_k, gemini_api_key }),
   });
 }
 
@@ -223,10 +224,14 @@ export async function getOverviewStats(): Promise<OverviewStats> {
   return req<OverviewStats>("/api/stats/overview");
 }
 
-export async function scrapeWebsite(url: string, max_pages = 25): Promise<WebsiteScrapeResult> {
+export async function scrapeWebsite(
+  url: string,
+  max_pages = 25,
+  single_page_only = false
+): Promise<WebsiteScrapeResult> {
   return req<WebsiteScrapeResult>("/api/websites/scrape", {
     method: "POST",
-    body: JSON.stringify({ url, max_pages }),
+    body: JSON.stringify({ url, max_pages, single_page_only }),
   });
 }
 

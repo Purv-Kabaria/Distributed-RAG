@@ -10,6 +10,7 @@ const GROQ_MODELS = [
   "mixtral-8x7b-32768",
   "gemma2-9b-it",
 ];
+const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"];
 
 interface Message {
   id: string;
@@ -20,6 +21,7 @@ interface Message {
 
 const CHAT_STORAGE_KEY = "dc.chat.history.v1";
 const CHAT_PERSIST_KEY = "dc.chat.persist.v1";
+const DEFAULT_OLLAMA_MODEL = "gemma3:4b";
 
 function escapeHtml(input: string): string {
   return input
@@ -87,8 +89,10 @@ export default function QueryPanel({
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [keepHistory, setKeepHistory] = useState(true);
-  const [provider, setProvider] = useState<"groq" | "ollama">("groq");
+  const [provider, setProvider] = useState<"groq" | "ollama" | "gemini">("groq");
   const [model, setModel] = useState("llama-3.3-70b-versatile");
+  const [geminiModel, setGeminiModel] = useState("gemini-2.5-flash");
+  const [geminiApiKey, setGeminiApiKey] = useState("");
   const [topK, setTopK] = useState(5);
   const [error, setError] = useState<string | null>(null);
   const [lastFailedPrompt, setLastFailedPrompt] = useState<string | null>(null);
@@ -124,7 +128,11 @@ export default function QueryPanel({
         setOllamaModels(names);
         setOllamaUnavailableReason(null);
         if (names.length > 0) {
-          setOllamaModel((prev) => (names.includes(prev) ? prev : names[0]));
+          setOllamaModel((prev) => {
+            if (names.includes(prev)) return prev;
+            if (names.includes(DEFAULT_OLLAMA_MODEL)) return DEFAULT_OLLAMA_MODEL;
+            return names[0];
+          });
         } else {
           setOllamaModel("");
         }
@@ -207,8 +215,8 @@ export default function QueryPanel({
     setLoading(true);
 
     try {
-      const activeModel = provider === "groq" ? model : ollamaModel;
-      const result = await queryRAG(q, provider, activeModel, topK);
+      const activeModel = provider === "groq" ? model : provider === "gemini" ? geminiModel : ollamaModel;
+      const result = await queryRAG(q, provider, activeModel, topK, provider === "gemini" ? geminiApiKey.trim() : undefined);
       const assistantMsg: Message = {
         id: Math.random().toString(36).slice(2),
         role: "assistant",
@@ -242,8 +250,8 @@ export default function QueryPanel({
     setMessages((prev) => [...prev, userMsg]);
     setLoading(true);
     try {
-      const activeModel = provider === "groq" ? model : ollamaModel;
-      const result = await queryRAG(q, provider, activeModel, topK);
+      const activeModel = provider === "groq" ? model : provider === "gemini" ? geminiModel : ollamaModel;
+      const result = await queryRAG(q, provider, activeModel, topK, provider === "gemini" ? geminiApiKey.trim() : undefined);
       const assistantMsg: Message = {
         id: Math.random().toString(36).slice(2),
         role: "assistant",
@@ -268,7 +276,7 @@ export default function QueryPanel({
       <div className="flex flex-wrap gap-2 p-3 border-b border-[var(--color-bg-border)] bg-[var(--color-bg-surface)]/60 backdrop-blur-sm">
         {/* Provider toggle */}
         <div className="flex rounded-lg overflow-hidden border border-[var(--color-bg-border)] text-xs">
-          {(["groq", "ollama"] as const).map((p) => (
+          {(["groq", "gemini", "ollama"] as const).map((p) => (
             <button
               key={p}
               onClick={() => setProvider(p)}
@@ -280,6 +288,8 @@ export default function QueryPanel({
             >
               {p === "groq"
                 ? <><Zap size={11} className="inline mr-1" />Groq</>
+                : p === "gemini"
+                  ? <><Zap size={11} className="inline mr-1" />Gemini</>
                 : <><Server size={11} className="inline mr-1" />Ollama</>}
             </button>
           ))}
@@ -296,6 +306,29 @@ export default function QueryPanel({
               {GROQ_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
             <ChevronDown size={11} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-[var(--color-text-muted)]" />
+          </div>
+        ) : provider === "gemini" ? (
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <select
+                value={geminiModel}
+                onChange={(e) => setGeminiModel(e.target.value)}
+                className="appearance-none text-xs bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] text-[var(--color-text-secondary)] rounded-lg px-3 py-1.5 pr-7 focus:outline-none focus:border-[var(--color-brand)] cursor-pointer min-w-40"
+              >
+                {GEMINI_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}
+              </select>
+              <ChevronDown size={11} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-[var(--color-text-muted)]" />
+            </div>
+            <input
+              type="password"
+              value={geminiApiKey}
+              onChange={(e) => setGeminiApiKey(e.target.value)}
+              placeholder="Gemini API key (optional)"
+              className="text-xs bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] text-[var(--color-text-secondary)] placeholder-[var(--color-text-muted)] rounded-lg px-3 py-1.5 focus:outline-none focus:border-[var(--color-brand)] min-w-56"
+            />
+            <span className="text-xs text-[var(--color-text-muted)]">
+              Uses this key if provided; otherwise uses .env key
+            </span>
           </div>
         ) : (
           <div className="flex items-center gap-1.5">

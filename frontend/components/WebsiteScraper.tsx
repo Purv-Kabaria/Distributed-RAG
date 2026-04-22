@@ -7,6 +7,7 @@ import { scrapeWebsite } from "@/lib/api";
 export default function WebsiteScraper({ onQueued }: { onQueued?: () => void }) {
   const [url, setUrl] = useState("");
   const [maxPages, setMaxPages] = useState(25);
+  const [singlePageOnly, setSinglePageOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{ doc_id: string; pages_scraped: number; source_url: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -19,7 +20,7 @@ export default function WebsiteScraper({ onQueued }: { onQueued?: () => void }) 
     setError(null);
     setResult(null);
     try {
-      const r = await scrapeWebsite(url.trim(), maxPages);
+      const r = await scrapeWebsite(url.trim(), maxPages, singlePageOnly);
       setResult({ doc_id: r.doc_id, pages_scraped: r.pages_scraped, source_url: r.source_url });
       setHistory((prev) => [{ url: r.source_url, pages: r.pages_scraped }, ...prev].slice(0, 5));
       onQueued?.();
@@ -50,6 +51,7 @@ export default function WebsiteScraper({ onQueued }: { onQueued?: () => void }) 
           <select
             value={maxPages}
             onChange={(e) => setMaxPages(Number(e.target.value))}
+            disabled={singlePageOnly}
             className="bg-[var(--color-bg-elevated)] border border-[var(--color-bg-border)] text-[var(--color-text-secondary)] rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[var(--color-brand)]"
           >
             {[10, 25, 50, 75, 100].map((n) => (
@@ -59,6 +61,15 @@ export default function WebsiteScraper({ onQueued }: { onQueued?: () => void }) 
             ))}
           </select>
         </div>
+        <label className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+          <input
+            type="checkbox"
+            checked={singlePageOnly}
+            onChange={(e) => setSinglePageOnly(e.target.checked)}
+            className="accent-[var(--color-brand)]"
+          />
+          Single page only (scrape only the provided link)
+        </label>
         <button
           type="submit"
           disabled={loading || !url.trim()}
@@ -69,7 +80,9 @@ export default function WebsiteScraper({ onQueued }: { onQueued?: () => void }) 
         </button>
       </form>
       <div className="text-[11px] text-[var(--color-text-muted)]">
-        Crawls same-domain HTML pages only. Use page limit to control runtime and token size.
+        {singlePageOnly
+          ? "Scrapes only the exact URL you provide."
+          : "Crawls same-domain HTML pages only. Use page limit to control runtime and token size."}
       </div>
       {result && (
         <div className="text-xs text-[var(--color-success)] bg-[#052010] border border-green-900/40 rounded-lg px-3 py-2">

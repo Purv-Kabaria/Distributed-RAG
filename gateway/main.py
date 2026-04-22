@@ -212,14 +212,16 @@ async def delete_document(doc_id: str):
 
 class QueryRequest(BaseModel):
     question: str
-    provider: str = "groq"   # groq | ollama
+    provider: str = "groq"   # groq | ollama | gemini
     model: Optional[str] = None
     top_k: int = 5
+    gemini_api_key: Optional[str] = None
 
 
 class WebsiteScrapeRequest(BaseModel):
     url: str
     max_pages: int = SCRAPE_MAX_PAGES_DEFAULT
+    single_page_only: bool = False
 
 
 class TextExtractor(HTMLParser):
@@ -274,7 +276,7 @@ def clean_text(txt: str) -> str:
     return re.sub(r"\s+", " ", txt or "").strip()
 
 
-async def scrape_site(seed_url: str, max_pages: int) -> tuple[str, int]:
+async def scrape_site(seed_url: str, max_pages: int, single_page_only: bool = False) -> tuple[str, int]:
     visited = set()
     q = deque([seed_url])
     docs = []
@@ -305,12 +307,13 @@ async def scrape_site(seed_url: str, max_pages: int) -> tuple[str, int]:
                 continue
             pages += 1
             docs.append(f"URL: {current}\n\n{text}")
-            for href in parser.links:
-                nxt, _ = urldefrag(urljoin(current, href))
-                if not nxt.startswith(("http://", "https://")):
-                    continue
-                if same_host(seed_url, nxt) and nxt not in visited:
-                    q.append(nxt)
+            if not single_page_only:
+                for href in parser.links:
+                    nxt, _ = urldefrag(urljoin(current, href))
+                    if not nxt.startswith(("http://", "https://")): 
+                        continue
+                    if same_host(seed_url, nxt) and nxt not in visited:
+                        q.append(nxt)
     return "\n\n" + ("\n\n".join(docs)), pages
 
 
@@ -339,7 +342,8 @@ async def scrape_website(req: WebsiteScrapeRequest):
     base = normalize_url(req.url)
     if not base:
         raise HTTPException(400, "Invalid URL")
-    content, pages = await scrape_site(base, req.max_pages)
+    effective_max_pages = 1 if req.single_page_only else req.max_pages
+    content, pages = await scrape_site(base, effective_max_pages, req.single_page_only)
     if pages == 0 or not content.strip():
         raise HTTPException(400, "No scrapeable HTML content found")
 

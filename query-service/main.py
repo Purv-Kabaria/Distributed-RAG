@@ -28,8 +28,10 @@ POSTGRES_URL       = os.getenv("POSTGRES_URL")
 VECTOR_STORE_URL   = os.getenv("VECTOR_STORE_URL", "http://vector-store:8003")
 EMBEDDING_URL      = os.getenv("EMBEDDING_SERVICE_URL", "http://embedding-worker:8002")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 OLLAMA_URL         = os.getenv("OLLAMA_URL", "")
 GROQ_DEFAULT_MODEL = os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile")
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")
 OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "gemma3:4b")
 QUESTION_MAX_CHARS = int(os.getenv("QUESTION_MAX_CHARS", "6000"))
 TOP_K_MIN = int(os.getenv("TOP_K_MIN", "1"))
@@ -39,6 +41,7 @@ LANG_ENFORCE_ANSWER_MAX_CHARS = int(os.getenv("LANG_ENFORCE_ANSWER_MAX_CHARS", "
 EMBED_TIMEOUT_SEC = float(os.getenv("EMBED_TIMEOUT_SEC", "30"))
 VECTOR_TIMEOUT_SEC = float(os.getenv("VECTOR_TIMEOUT_SEC", "20"))
 GROQ_TIMEOUT_SEC = float(os.getenv("GROQ_TIMEOUT_SEC", "60"))
+GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "60"))
 OLLAMA_TIMEOUT_SEC = float(os.getenv("OLLAMA_TIMEOUT_SEC", "120"))
 HTTP_RETRIES = int(os.getenv("QUERY_HTTP_RETRIES", "2"))
 DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
@@ -116,6 +119,16 @@ async def list_models():
     else:
         providers.append({"provider": "ollama", "models": [], "available": False,
                           "reason": "OLLAMA_URL not set"})
+    providers.append({
+        "provider": "gemini",
+        "models": [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-pro",
+        ],
+        "available": True,
+        "reason": "" if GEMINI_API_KEY else "Provide key in Query tab or set GEMINI_API_KEY in .env",
+    })
 
     return {"providers": providers}
 
@@ -428,13 +441,46 @@ async def call_ollama(prompt: str, model: str) -> str:
     raise last_exc
 
 
+async def call_gemini(prompt: str, model: str, api_key_override: Optional[str] = None) -> str:
+    key = (api_key_override or "").strip() or GEMINI_API_KEY
+    if not key:
+        raise HTTPException(400, "Gemini API key not configured. Provide one in Query tab or set GEMINI_API_KEY in .env")
+    last_exc = None
+    for _ in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT_SEC) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_DEFAULT_MODEL}:generateContent",
+                    params={"key": key},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.2,
+                            "maxOutputTokens": 1024,
+                        },
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    return ""
+                parts = (candidates[0].get("content") or {}).get("parts") or []
+                text_parts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+                return "".join(text_parts).strip()
+        except Exception as e:
+            last_exc = e
+    raise last_exc
+
+
 # ── Main Query Endpoint ───────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     question:  str
-    provider:  str = "groq"   # groq | ollama
+    provider:  str = "groq"   # groq | ollama | gemini
     model:     Optional[str] = None
     top_k:     int = 5
+    gemini_api_key: Optional[str] = None
 
 
 @app.post("/api/query")
@@ -489,6 +535,9 @@ async def query(req: QueryRequest):
         elif req.provider == "ollama":
             answer = await call_ollama(prompt, model or OLLAMA_DEFAULT_MODEL)
             used_model = model or OLLAMA_DEFAULT_MODEL
+        elif req.provider == "gemini":
+            answer = await call_gemini(prompt, model or GEMINI_DEFAULT_MODEL, req.gemini_api_key)
+            used_model = model or GEMINI_DEFAULT_MODEL
         else:
             raise HTTPException(400, f"Unknown provider: {req.provider}")
     except HTTPException:
@@ -507,6 +556,8 @@ async def query(req: QueryRequest):
                 answer = await call_groq(retry_prompt, model or GROQ_DEFAULT_MODEL)
             elif req.provider == "ollama":
                 answer = await call_ollama(retry_prompt, model or OLLAMA_DEFAULT_MODEL)
+            elif req.provider == "gemini":
+                answer = await call_gemini(retry_prompt, model or GEMINI_DEFAULT_MODEL, req.gemini_api_key)
         except Exception:
             pass
 
