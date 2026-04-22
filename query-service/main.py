@@ -341,29 +341,67 @@ def build_prompt(question: str, chunks: list[dict]) -> str:
         kind = c.get("chunk_kind") or "generic"
         file_type = c.get("file_type") or "unknown"
         content = (c.get("text") or "")[:CONTEXT_CHARS_PER_CHUNK]
-        blocks.append(f"[Source {i + 1}{th} | score={c['score']:.3f} | kind={kind} | type={file_type}]\n{content}")
+        blocks.append(f"[Context Chunk {i + 1}{th} | score={c['score']:.3f} | kind={kind} | type={file_type}]\n{content}")
     context = "\n\n---\n\n".join(blocks)
     quote_rule = (
         "If the user explicitly asks for an exact quote or verbatim text, provide exact wording from context."
         if prefers_exact_quote
         else "For audio/video transcript content, do not merely quote raw lines; prefer concise paraphrased explanations in your own words while preserving meaning."
     )
-    return f"""[SYSTEM]
-You are a precision RAG assistant. Use ONLY the provided CONTEXT.
+    return f"""[SYSTEM ROLE]
+You are a rigorous, retrieval-grounded analyst. Your job is to deliver the most accurate possible answer using ONLY the provided CONTEXT.
 
-Answer in English only.
-If any part of the provided context or the question is not English, translate it to English and respond in English.
-Do not output any non-English text. Do not include words or sentences in other languages.
-If you cannot produce an English answer using ONLY the provided context, say: "I don't know based on the provided context." (in English).
-For audio or video transcripts, lines look like [MM:SS.mm–MM:SS.mm] speech. When the user asks when something was said or shown, include timestamps (or media_time ranges in seconds).
-For image or video visual descriptions, use the described content as factual evidence.
-{quote_rule}
-Use multi-source reasoning: compare relevant sources, reconcile contradictions, and prefer the highest-scoring evidence.
-Never use outside knowledge. Never invent missing details.
-When uncertain, state uncertainty explicitly instead of hallucinating.
-For tricky questions requiring synthesis across multiple chunks, give a short direct answer first, then a brief evidence-based explanation.
-After each major claim, cite evidence as [Source N].
-If evidence is insufficient or conflicting, answer exactly: "I don't know based on the provided context."
+[TOP PRIORITIES]
+Priority 1: factual correctness from context.
+Priority 2: explicit uncertainty over speculation.
+Priority 3: clear, concise Markdown output.
+
+[HARD CONSTRAINTS]
+1) English only output. Translate internally when needed.
+2) Use only provided context; never inject external knowledge.
+3) Never invent entities, numbers, timestamps, relationships, or causes.
+4) If evidence is missing, weak, ambiguous, or contradictory, output exactly:
+I don't know based on the provided context.
+5) Never cite or reference sources in any form for any modality (text, docs, audio, image, video).
+   Forbidden: source/chunk labels, bracket citations, document names, URLs, file paths, metadata references, or phrases implying direct source attribution.
+6) Output valid Markdown only.
+
+[TASK ROUTING]
+Classify the question intent before answering:
+- factual lookup
+- synthesis across multiple chunks
+- comparison/difference
+- chronology/timeline
+- procedural/how-to
+- exact-quote request
+
+[EVIDENCE FUSION POLICY]
+- Merge overlapping facts from multiple chunks into one coherent answer.
+- Prefer high-confidence, specific, and mutually consistent evidence.
+- If two claims conflict and cannot be reconciled safely, abstain with the exact fallback sentence.
+- Prefer precision over breadth; omit unsupported details.
+
+[MEDIA INTERPRETATION POLICY]
+- For transcripts: treat spoken lines and timing markers as factual evidence.
+- For visual frames/images: treat described visual content as evidence without extrapolation.
+- If user asks "when", include timestamp/media_time only when present.
+- If timing is requested but absent, explicitly say timing is unavailable in context.
+- {quote_rule}
+
+[ANSWER QUALITY POLICY]
+- Lead with the direct answer first.
+- For complex questions, follow with compact supporting bullets.
+- Avoid repeating the question.
+- Avoid generic disclaimers and filler text.
+- Keep tone neutral, technical, and decisive when evidence is strong.
+- If user asks for steps/checklists/tables, provide them in Markdown when context supports it.
+
+[SAFETY AGAINST HALLUCINATION]
+Before finalizing, self-check silently:
+- Is every factual claim grounded in context?
+- Did I avoid all source/citation references?
+- Did I avoid unsupported inference leaps?
+- If unsure on any major claim, use the exact fallback sentence.
 
 [USER QUESTION]
 {question}
@@ -371,10 +409,11 @@ If evidence is insufficient or conflicting, answer exactly: "I don't know based 
 [CONTEXT]
 {context}
 
-[RESPONSE FORMAT]
-1) Direct answer (2-5 sentences max)
-2) Evidence bullets with citations [Source N]
-3) If asked for time in audio/video, include timestamp(s)
+[OUTPUT FORMAT]
+- Markdown only
+- Start with direct answer (1-5 sentences)
+- Add concise bullets/sections only when useful
+- Do not enforce fixed number of bullets or sections
 """
 
 
@@ -382,6 +421,16 @@ def likely_non_english(text: str) -> bool:
     # Conservative detection for common non-Latin scripts.
     s = text or ""
     return bool(re.search(r"[\u0400-\u04FF\u0370-\u03FF\u4E00-\u9FFF\u0600-\u06FF\u0900-\u097F\u0B80-\u0BFF]", s))
+
+
+def normalize_answer_markdown(answer: str) -> str:
+    out = (answer or "").strip()
+    out = re.sub(r"\[(?:source|context\s*chunk)\s+\d+\]", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\[(?:\d+|chunk\s*\d+|doc(?:ument)?\s*\d+)\]", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\b(?:according to|based on|from)\s+(?:the\s+)?(?:source|sources|context|chunk|chunks|document|documents)\b[:\-\s]*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\b(?:source|sources|context|chunk|chunks)\s*[:\-]\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 async def call_groq(prompt: str, model: str) -> str:
@@ -393,7 +442,7 @@ async def call_groq(prompt: str, model: str) -> str:
             async with httpx.AsyncClient(timeout=GROQ_TIMEOUT_SEC) as client:
                 system_msg = (
                     "You must respond in English only. If the provided context or question contains any other language, translate it to English before answering. "
-                    "Output only English text and nothing else."
+                    "Output must be valid Markdown only. Never cite or reference sources, chunks, documents, URLs, or context labels in any form."
                 )
                 r = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
@@ -422,7 +471,7 @@ async def call_ollama(prompt: str, model: str) -> str:
     last_exc = None
     enforced_prompt = (
         "You must respond in English only. If the provided context or question contains any other language, translate it to English. "
-        "Output only English text and nothing else.\n\n"
+        "Output must be valid Markdown only. Never cite or reference sources, chunks, documents, URLs, or context labels in any form.\n\n"
         + prompt
     )
     for _ in range(HTTP_RETRIES + 1):
@@ -449,11 +498,16 @@ async def call_gemini(prompt: str, model: str, api_key_override: Optional[str] =
     for _ in range(HTTP_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT_SEC) as client:
+                enforced_prompt = (
+                    "Respond in English only. Output valid Markdown only. "
+                    "Never cite or reference sources, chunks, documents, URLs, or context labels in any form.\n\n"
+                    + prompt
+                )
                 r = await client.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_DEFAULT_MODEL}:generateContent",
                     params={"key": key},
                     json={
-                        "contents": [{"parts": [{"text": prompt}]}],
+                        "contents": [{"parts": [{"text": enforced_prompt}]}],
                         "generationConfig": {
                             "temperature": 0.2,
                             "maxOutputTokens": 1024,
@@ -560,6 +614,8 @@ async def query(req: QueryRequest):
                 answer = await call_gemini(retry_prompt, model or GEMINI_DEFAULT_MODEL, req.gemini_api_key)
         except Exception:
             pass
+
+    answer = normalize_answer_markdown(answer)
 
     if likely_non_english(answer):
         raise HTTPException(
