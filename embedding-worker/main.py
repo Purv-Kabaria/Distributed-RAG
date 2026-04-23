@@ -37,6 +37,8 @@ UPLOAD_DIR        = Path(os.getenv("UPLOAD_DIR", "/uploads"))
 CONCURRENCY       = int(os.getenv("WORKER_CONCURRENCY", "2"))
 QUERY_EMBED_CONCURRENCY = int(os.getenv("QUERY_EMBED_CONCURRENCY", "8"))
 QUEUE_POP_TIMEOUT_SEC = int(os.getenv("EMBEDDING_QUEUE_POP_TIMEOUT_SEC", "2"))
+EMBED_HTTP_RETRIES = int(os.getenv("EMBED_HTTP_RETRIES", "3"))
+EMBED_RETRY_BACKOFF_SEC = float(os.getenv("EMBED_RETRY_BACKOFF_SEC", "1.2"))
 
 # Gemini Embedding 2 - first natively multimodal embedding model
 EMBEDDING_MODEL   = "gemini-embedding-2-preview"
@@ -98,7 +100,16 @@ async def embed_text(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[f
         )
         return result.embeddings[0].values
 
-    return await loop.run_in_executor(None, _call)
+    last_exc = None
+    for attempt in range(EMBED_HTTP_RETRIES + 1):
+        try:
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            last_exc = e
+            if attempt >= EMBED_HTTP_RETRIES:
+                break
+            await asyncio.sleep(EMBED_RETRY_BACKOFF_SEC * (attempt + 1))
+    raise last_exc
 
 
 async def embed_multimodal(file_path: Path, file_type: str) -> list[float]:
@@ -125,7 +136,16 @@ async def embed_multimodal(file_path: Path, file_type: str) -> list[float]:
         )
         return result.embeddings[0].values
 
-    return await loop.run_in_executor(None, _call)
+    last_exc = None
+    for attempt in range(EMBED_HTTP_RETRIES + 1):
+        try:
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            last_exc = e
+            if attempt >= EMBED_HTTP_RETRIES:
+                break
+            await asyncio.sleep(EMBED_RETRY_BACKOFF_SEC * (attempt + 1))
+    raise last_exc
 
 
 def _guess_image_mime(p: Path) -> str:
