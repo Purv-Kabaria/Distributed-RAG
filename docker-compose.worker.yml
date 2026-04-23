@@ -15,23 +15,21 @@ services:
     volumes:
       - ${SHARED_UPLOADS_DIR:-./uploads-worker}:/uploads
     environment:
-      # Central infrastructure endpoints (host machine running main docker-compose.yml)
       - REDIS_URL=redis://${PUBLIC_HOST:-localhost}:6379
       - POSTGRES_URL=postgresql://raguser:ragpassword@${PUBLIC_HOST:-localhost}:5432/ragdb
-      # Keep embedding endpoint local to this worker stack by default.
-      # Override with EMBEDDING_SERVICE_URL if you want ingestion jobs routed elsewhere.
       - EMBEDDING_SERVICE_URL=${EMBEDDING_SERVICE_URL:-http://embedding-worker:8002}
       - UPLOAD_DIR=/uploads
       - WHISPER_MODEL_SIZE=${WHISPER_MODEL_SIZE:-small}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-}
       - WHISPER_DOWNLOAD_ROOT=${WHISPER_DOWNLOAD_ROOT:-/models/whisper}
       - WHISPER_LOCAL_ONLY=${WHISPER_LOCAL_ONLY:-1}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OLLAMA_URL=${OLLAMA_URL:-}
       - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
       - GEMINI_VISION_MODEL=${GEMINI_VISION_MODEL:-gemini-2.0-flash}
       - VISION_ORDER=${VISION_ORDER:-ollama_then_gemini}
       - VIDEO_VISUAL_MAX_FRAMES=${VIDEO_VISUAL_MAX_FRAMES:-6}
-      - VIDEO_VISUAL_INTERVAL_SEC=${VIDEO_VISUAL_INTERVAL_SEC:-45}
+      - VIDEO_VISUAL_INTERVAL_SEC=${VIDEO_VISUAL_INTERVAL_SEC:-5}
       - INGESTION_CONCURRENCY=${INGESTION_CONCURRENCY:-2}
       - INGESTION_QUEUE_POP_TIMEOUT_SEC=${INGESTION_QUEUE_POP_TIMEOUT_SEC:-2}
       - INGESTION_FILE_RETRY_MAX=${INGESTION_FILE_RETRY_MAX:-6}
@@ -52,4 +50,4 @@ services:
       - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-2}
       - QUERY_EMBED_CONCURRENCY=${QUERY_EMBED_CONCURRENCY:-8}
       - EMBEDDING_QUEUE_POP_TIMEOUT_SEC=${EMBEDDING_QUEUE_POP_TIMEOUT_SEC:-2}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}

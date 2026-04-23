@@ -35,7 +35,7 @@ Shared infrastructure:
 
 ### Query flow
 
-`frontend -> gateway /api/query -> query-service -> embedding-worker (/api/embed/text) + vector-store (/api/vectors/search) -> groq/ollama`
+`frontend -> gateway /api/query -> query-service -> embedding-worker (/api/embed/text) + vector-store (/api/vectors/search) -> groq/ollama/gemini`
 
 ---
 
@@ -49,6 +49,7 @@ Shared infrastructure:
 - Website scraping endpoint (`/api/websites/scrape`).
 - Aggregated health/queue/overview metrics.
 - Client heartbeat intake for multi-device visibility.
+- Returns per-document chunking/indexing progress counters in document list/status APIs.
 
 ### `ingestion-worker`
 
@@ -57,6 +58,7 @@ Shared infrastructure:
   - text, pdf
   - image (OCR + vision caption)
   - audio/video (Whisper timestamps + optional vision frames)
+- Whisper model is preloaded into the Docker image and loaded locally in container runtime (`WHISPER_LOCAL_ONLY=1` by default).
 - Stores chunks in Postgres.
 - Pushes embedding jobs to `embedding:queue`.
 - Supports concurrent consumers (`INGESTION_CONCURRENCY`).
@@ -82,9 +84,9 @@ Shared infrastructure:
 - Validates query inputs (`QUESTION_MAX_CHARS`, `TOP_K_MIN/MAX`).
 - Embeds query text via embedding-worker.
 - Retrieves context via vector-store.
-- Calls Groq or Ollama.
+- Calls Groq, Ollama, or Gemini.
 - Logs query metadata to Postgres.
-- Prompt enforces English output.
+- Prompt enforces English output, strict grounding, Markdown output, and no direct source citations in responses.
 
 ---
 
@@ -102,7 +104,9 @@ Notable behaviors:
 
 - Query supports persistent chat, new chat, markdown answer rendering.
 - Ollama model selection in Query is dropdown-only from installed models.
+- Gemini is available as a Query provider with optional per-request API key override (falls back to `GEMINI_API_KEY` from env).
 - System shows queue depth, service health, active device count, ingestion/embedding metrics.
+- Documents tab shows live per-document chunking and indexing progress.
 - Scrape tab ingests same-domain website content into the existing pipeline.
 
 ---
@@ -176,6 +180,12 @@ Key tunables:
 - Worker file accessibility retry:
   - `INGESTION_FILE_RETRY_MAX`
   - `INGESTION_FILE_RETRY_DELAY_SEC`
+
+- Whisper local model controls:
+  - `WHISPER_MODEL_SIZE`
+  - `WHISPER_MODEL_PATH`
+  - `WHISPER_DOWNLOAD_ROOT`
+  - `WHISPER_LOCAL_ONLY`
 
 See `.env.example` for full list and defaults.
 
@@ -258,6 +268,7 @@ Use this file when running extra ingestion/embedding workers on another machine.
 2. Ingestion workers must access the same uploads path:
    - set `SHARED_UPLOADS_DIR` to a shared/network path mirrored at `/uploads`.
 3. Workers are intended for ingestion + embedding only.
+4. Remote ingestion worker images preload Whisper model at build time using `WHISPER_MODEL_SIZE`.
 
 ### Run remote workers
 
@@ -272,6 +283,10 @@ docker compose -f docker-compose.worker.yml up -d --build
 - `QUERY_EMBED_CONCURRENCY`
 - `INGESTION_QUEUE_POP_TIMEOUT_SEC`
 - `EMBEDDING_QUEUE_POP_TIMEOUT_SEC`
+- `WHISPER_MODEL_SIZE`
+- `WHISPER_MODEL_PATH`
+- `WHISPER_DOWNLOAD_ROOT`
+- `WHISPER_LOCAL_ONLY`
 
 ---
 
@@ -394,8 +409,9 @@ Test-NetConnection <docker-host-ip> -Port 8000
 1. `docker compose ps` shows healthy services.
 2. Upload text/pdf/image/audio/video and watch status reach `done`.
 3. Scrape a website in Scrape tab and verify new document appears.
-4. Query with Groq and Ollama models.
+4. Query with Groq, Ollama, and Gemini models.
 5. Confirm Ollama model selector shows installed models only.
 6. Open app from a second device and confirm metrics show active devices.
-7. If remote workers enabled, confirm chunks/embeddings continue flowing and are queryable.
+7. While ingesting, confirm each document shows chunking/indexing progress in Documents tab.
+8. If remote workers enabled, confirm chunks/embeddings continue flowing and are queryable.
 
