@@ -472,11 +472,37 @@ def vector_metadata_from_extra(extra: dict) -> dict:
     return vm
 
 
+def resolve_job_file_path(job: dict) -> Path:
+    filename = (job.get("filename") or "").strip()
+    raw_path = (job.get("file_path") or "").strip()
+    candidates: list[Path] = []
+    if raw_path:
+        candidates.append(Path(raw_path))
+    if filename:
+        candidates.append(UPLOAD_DIR / filename)
+    if raw_path:
+        candidates.append(UPLOAD_DIR / Path(raw_path).name)
+    seen: set[str] = set()
+    ordered: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    for candidate in ordered:
+        if candidate.exists():
+            return candidate
+    if ordered:
+        return ordered[0]
+    return UPLOAD_DIR / filename
+
+
 async def process_job(job: dict):
     doc_id = job["doc_id"]
     filename = job["filename"]
     file_type = job["file_type"]
-    file_path = Path(job["file_path"])
+    file_path = resolve_job_file_path(job)
     retries = int(job.get("_ingestion_retries", 0))
 
     log.info(f"Processing doc={doc_id} type={file_type}")
